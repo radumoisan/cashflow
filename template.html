@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cash Flow | ${start_month} to ${end_month}</title>
+  <style>
+    :root {
+      --ink: #2e3035;
+      --line: #dedee3;
+      --stripe: #f5f3fa;
+      --accent: #27206f;
+      --header: #f7f7f8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #fff;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .report {
+      width: calc(100% - 48px);
+      margin: 0 auto;
+      padding: 24px 0 48px;
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 10px;
+    }
+
+    .currency-toggle {
+      display: inline-flex;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--header);
+    }
+
+    .currency-option {
+      min-width: 52px;
+      padding: 6px 11px;
+      border: 0;
+      border-radius: 4px;
+      color: #55575b;
+      background: transparent;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .currency-option[aria-pressed="true"] {
+      color: #fff;
+      background: var(--accent);
+    }
+
+    .currency-option:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .table-scroll {
+      width: 100%;
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+      border: 1px solid var(--line);
+    }
+
+    table {
+      width: 100%;
+      min-width: 1380px;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    col.category-column { width: 300px; }
+
+    th,
+    td {
+      height: 39px;
+      padding: 8px;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    table > tbody:last-of-type > tr:last-child th,
+    table > tbody:last-of-type > tr:last-child td { border-bottom: 0; }
+
+    th:last-child,
+    td:last-child { border-right: 0; }
+
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      color: #55575b;
+      background: var(--header);
+      font-size: 12px;
+      font-weight: 500;
+      text-align: right;
+    }
+
+    thead th:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 4;
+      text-align: left;
+    }
+
+    tbody th {
+      position: sticky;
+      left: 0;
+      z-index: 1;
+      background: #fff;
+      font-weight: 400;
+      text-align: left;
+    }
+
+    tbody td {
+      text-align: right;
+    }
+
+    .activity-heading-row {
+      color: var(--accent);
+      background: #eae8f3;
+      border-top: 2px solid #c7c3db;
+    }
+
+    .activity-heading-row th {
+      background: #eae8f3;
+      padding: 0;
+    }
+
+    .activity-fill { background: #eae8f3; }
+
+    .group-toggle {
+      display: flex;
+      width: 100%;
+      height: 38px;
+      align-items: center;
+      gap: 9px;
+      padding: 0 8px;
+      border: 0;
+      color: var(--accent);
+      background: transparent;
+      font: inherit;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .group-toggle:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -3px;
+    }
+
+    .toggle-mark {
+      display: inline-grid;
+      width: 18px;
+      height: 18px;
+      place-items: center;
+      border: 1px solid #aaa5c5;
+      border-radius: 2px;
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .activity-children[hidden] { display: none; }
+
+    .activity-children .subcategory-row:nth-child(even) {
+      background: var(--stripe);
+    }
+
+    .activity-children .subcategory-row:nth-child(even) th {
+      background: var(--stripe);
+    }
+
+    .subcategory-row th {
+      padding-left: 35px;
+    }
+
+    .subtotal-row {
+      color: var(--accent);
+      background: #f0eef7;
+      font-weight: 700;
+      border-bottom: 2px solid #c7c3db;
+    }
+
+    .subtotal-row th {
+      color: #3d3d43;
+      background: #f0eef7;
+      font-weight: 700;
+      text-align: right;
+    }
+
+    .balance-row {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .balance-row th {
+      color: var(--accent);
+      background: #fff;
+      font-weight: 700;
+    }
+
+    .negative { color: #3d3d43; }
+    .closing-row .negative { color: #b42318; }
+
+    @media (max-width: 720px) {
+      body { font-size: 13px; }
+      .report { width: calc(100% - 24px); padding-top: 12px; }
+      .toolbar { margin-bottom: 8px; }
+      table { min-width: 1320px; }
+      col.category-column { width: 280px; }
+      th, td { padding: 8px; }
+    }
+
+    @media print {
+      @page { size: A4 landscape; margin: 10mm; }
+      .report { width: 100%; padding: 0; }
+      .toolbar { display: none; }
+      .table-scroll { max-height: none; overflow: visible; }
+      table { min-width: 0; font-size: 8px; }
+      col.category-column { width: 165px; }
+      th, td { height: 25px; padding: 4px; }
+      thead th, tbody th { position: static; }
+      .activity-children[hidden] { display: table-row-group; }
+      .toggle-mark { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="report" data-display-currency="${initial_currency}">
+    <div class="toolbar">
+      <div class="currency-toggle" role="group" aria-label="Display currency">
+        <button class="currency-option" type="button" data-currency="RON" aria-pressed="${ron_pressed}">RON</button>
+        <button class="currency-option" type="button" data-currency="EUR" aria-pressed="${eur_pressed}">EUR</button>
+      </div>
+    </div>
+    <div class="table-scroll">
+      <table aria-label="Twelve-month cash flow">
+        <colgroup>
+          <col class="category-column">
+          <col span="12">
+        </colgroup>
+        <thead>
+          <tr>
+            <th scope="col">Activity / Category</th>
+            <th scope="col">Month 1</th>
+            <th scope="col">Month 2</th>
+            <th scope="col">Month 3</th>
+            <th scope="col">Month 4</th>
+            <th scope="col">Month 5</th>
+            <th scope="col">Month 6</th>
+            <th scope="col">Month 7</th>
+            <th scope="col">Month 8</th>
+            <th scope="col">Month 9</th>
+            <th scope="col">Month 10</th>
+            <th scope="col">Month 11</th>
+            <th scope="col">Month 12</th>
+          </tr>
+        </thead>
+        ${table_rows}
+      </table>
+    </div>
+  </main>
+  <script>
+    (() => {
+      const report = document.querySelector(".report");
+      const currencyButtons = document.querySelectorAll(".currency-option");
+      const amountCells = document.querySelectorAll("[data-ron][data-eur]");
+
+      currencyButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const currency = button.dataset.currency;
+          const valueKey = currency.toLowerCase();
+          report.dataset.displayCurrency = currency;
+          amountCells.forEach((cell) => {
+            cell.textContent = cell.dataset[valueKey];
+          });
+          currencyButtons.forEach((option) => {
+            option.setAttribute(
+              "aria-pressed",
+              String(option.dataset.currency === currency),
+            );
+          });
+        });
+      });
+
+      document.querySelectorAll(".group-toggle").forEach((button) => {
+        button.addEventListener("click", () => {
+          const children = document.getElementById(button.getAttribute("aria-controls"));
+          const expanded = button.getAttribute("aria-expanded") === "true";
+          children.hidden = expanded;
+          button.setAttribute("aria-expanded", String(!expanded));
+          button.querySelector(".toggle-mark").textContent = expanded ? "+" : "-";
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
