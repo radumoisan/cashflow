@@ -1,69 +1,211 @@
+schema_version: 2
 settings:
   company_name: "PLANEMO SOFTWARE LABS S.R.L."
   registration_number: "42131419"
   currency: "RON"
   ron_per_eur: 5.25
-  start_date: "2025-01"
+  start_date: "2026-01"
   projection_months: 12
+  history_start: "2025-01"
   initial_balance: 1590.00
-  dashboard_mode: "actuals"
-  actuals_file: "accounting/actuals-2025.yaml"
 
-# Profit categories with activity, plus categories that exist only in cash reporting.
-# Depreciation is intentionally excluded because it is not a cash movement.
-categories:
-  - id: "software"
-    name: "Software"
+# Browser edits affect only sparse overrides in unclosed periods.
+# Clients/Suppliers forecast values are NET of VAT.
+rows:
+  - id: "clients"
+    name: "Clients (net)"
     activity: "operating"
-  - id: "salarii"
-    name: "Salarii"
+    forecast: "carry"
+    profit_weight: 1
+    seed: null
+    overrides: {}
+  - id: "suppliers"
+    name: "Suppliers (net)"
     activity: "operating"
-  - id: "servicii-terti"
-    name: "Servicii Terti"
-    activity: "operating"
-  - id: "it"
-    name: "IT"
-    activity: "operating"
-  - id: "autovehicule"
-    name: "Autovehicule"
-    activity: "operating"
-  - id: "diverse"
-    name: "Diverse"
-    activity: "operating"
-  - id: "administrative"
-    name: "Administrative"
-    activity: "operating"
-  - id: "marketing"
-    name: "Marketing"
-    activity: "operating"
-  - id: "deplasari-and-transport"
-    name: "Deplasari & Transport"
-    activity: "operating"
-  - id: "taxe-si-impozite"
-    name: "Taxe si impozite"
-    activity: "operating"
+    forecast: "carry"
+    profit_weight: 1
+    seed: null
+    overrides: {}
   - id: "advances"
     name: "Advances"
     activity: "operating"
+    forecast: "zero"
+    profit_weight: 0
+    seed: null
+    overrides: {}
+  - id: "net-salaries-and-taxes"
+    name: "Payroll"
+    activity: "operating"
+    forecast: "carry"
+    profit_weight: 1
+    seed: null
+    overrides: {}
   - id: "vat"
     name: "VAT"
     activity: "operating"
+    forecast: "vat"
+    profit_weight: 0
+    seed: null
+    overrides: {}
+  - id: "taxes"
+    name: "Taxes"
+    activity: "operating"
+    forecast: "taxes"
+    profit_weight: 0
+    seed: null
+    overrides: {}
+  - id: "miscelaneous"
+    name: "Miscellaneous"
+    activity: "operating"
+    forecast: "zero"
+    profit_weight: 1
+    seed: null
+    overrides: {}
   - id: "fixed-assets"
     name: "Fixed Assets"
     activity: "investing"
+    forecast: "zero"
+    profit_weight: 0
+    seed: null
+    overrides: {}
   - id: "short-term-debt"
-    name: "Short Term Debt"
+    name: "Short-Term Debt"
     activity: "financing"
+    forecast: "zero"
+    profit_weight: 0
+    seed: null
+    overrides: {}
   - id: "interest-and-bank-charges"
     name: "Interest and Bank Charges"
     activity: "financing"
+    forecast: "carry"
+    profit_weight: 1
+    seed: null
+    overrides: {}
   - id: "shareholders"
-    name: "Shareholders"
+    name: "Other Shareholder Movements"
     activity: "financing"
+    forecast: "zero"
+    profit_weight: 0
+    seed: null
+    overrides: {}
+  - id: "dividends-paid"
+    name: "Dividends Paid"
+    activity: "financing"
+    forecast: "dividends"
+    profit_weight: 0
+    seed: null
+    overrides: {}
   - id: "intercompany-settlements"
-    name: "Intercompany settlements"
+    name: "Intercompany Settlements"
     activity: "financing"
+    forecast: "zero"
+    profit_weight: 0
+    seed: null
+    overrides: {}
 
-# Future assumptions remain separate from the historical accounting reference.
-recurring: []
-events: []
+# Closed 2025 report, reconciled to both Keez PDFs. Values and reported balances
+# are preserved, including source discrepancies (annotated by the engine).
+# The app/export presents Clients/Suppliers net using estimated standard VAT,
+# moving the extracted portions into VAT; source records below retain gross cash.
+# Historical Shareholders remains unsplit: dividends-paid = 0 means no separate
+# reclassification, NOT proof that no historical dividends occurred.
+# New accounting months must be complete, contiguous, and use net basis.
+actuals:
+  "2025-01":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 1590.00
+    closing_balance: 9582.00
+    values: {clients: 125723.00, suppliers: -94689.00, advances: -4671.00, net-salaries-and-taxes: 0.00, vat: -7143.00, taxes: -2860.00, miscelaneous: 60.00, fixed-assets: -8352.00, short-term-debt: 0.00, interest-and-bank-charges: -76.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-02":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 9582.00
+    closing_balance: -41.00
+    values: {clients: 93807.00, suppliers: -64792.00, advances: -21559.00, net-salaries-and-taxes: -354.00, vat: -6850.00, taxes: -1418.00, miscelaneous: 0.00, fixed-assets: -8391.00, short-term-debt: 0.00, interest-and-bank-charges: -66.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-03":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: -41.00
+    closing_balance: -5570.00
+    values: {clients: 85277.00, suppliers: -42036.00, advances: -35392.00, net-salaries-and-taxes: 0.00, vat: 0.00, taxes: 0.00, miscelaneous: 0.00, fixed-assets: -8333.00, short-term-debt: 0.00, interest-and-bank-charges: -46.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: -5000.00}
+  "2025-04":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 3430.00
+    closing_balance: 9202.00
+    values: {clients: 83160.00, suppliers: -46730.00, advances: 2581.00, net-salaries-and-taxes: -354.00, vat: -2821.00, taxes: -1418.00, miscelaneous: 0.00, fixed-assets: -13289.00, short-term-debt: 0.00, interest-and-bank-charges: -71.00, shareholders: -15285.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-05":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 202.00
+    closing_balance: 516.00
+    values: {clients: 125797.00, suppliers: -63477.00, advances: -33358.00, net-salaries-and-taxes: -91.00, vat: -13146.00, taxes: -6815.00, miscelaneous: 0.00, fixed-assets: -8426.00, short-term-debt: 0.00, interest-and-bank-charges: -71.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: -100.00}
+  "2025-06":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 516.00
+    closing_balance: 12276.00
+    values: {clients: 213889.00, suppliers: -142733.00, advances: -56286.00, net-salaries-and-taxes: -3544.00, vat: -9359.00, taxes: -9616.00, miscelaneous: 0.00, fixed-assets: -8456.00, short-term-debt: 29491.00, interest-and-bank-charges: -1826.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 200.00}
+  "2025-07":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 12276.00
+    closing_balance: 421.00
+    values: {clients: 82479.00, suppliers: -102118.00, advances: -4700.00, net-salaries-and-taxes: -1772.00, vat: -12646.00, taxes: -6382.00, miscelaneous: -210.00, fixed-assets: -23324.00, short-term-debt: 57596.00, interest-and-bank-charges: -779.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-08":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 421.00
+    closing_balance: 110.00
+    values: {clients: 101719.00, suppliers: -109926.00, advances: -25294.00, net-salaries-and-taxes: 0.00, vat: 0.00, taxes: 0.00, miscelaneous: 0.00, fixed-assets: 0.00, short-term-debt: 34659.00, interest-and-bank-charges: -1469.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-09":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 110.00
+    closing_balance: 658.00
+    values: {clients: 77335.00, suppliers: -59967.00, advances: -21453.00, net-salaries-and-taxes: -2126.00, vat: 0.00, taxes: -1418.00, miscelaneous: 0.00, fixed-assets: -8146.00, short-term-debt: 17897.00, interest-and-bank-charges: -1574.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-10":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 658.00
+    closing_balance: 472.00
+    values: {clients: 86335.00, suppliers: -77100.00, advances: -2838.00, net-salaries-and-taxes: 0.00, vat: 0.00, taxes: 0.00, miscelaneous: 0.00, fixed-assets: -8590.00, short-term-debt: 3355.00, interest-and-bank-charges: -1649.00, shareholders: 300.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-11":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 472.00
+    closing_balance: 130.00
+    values: {clients: 97463.00, suppliers: -202465.00, advances: 213419.00, net-salaries-and-taxes: -3544.00, vat: -4887.00, taxes: 0.00, miscelaneous: 0.00, fixed-assets: -8591.00, short-term-debt: -90597.00, interest-and-bank-charges: -1140.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+  "2025-12":
+    source: "keez-exports/cashflow-2025.pdf, page 1"
+    basis: "reported"
+    opening_balance: 130.00
+    closing_balance: 3758.00
+    values: {clients: 88699.00, suppliers: -132570.00, advances: 3126.00, net-salaries-and-taxes: -26059.00, vat: 0.00, taxes: 0.00, miscelaneous: 0.00, fixed-assets: -8582.00, short-term-debt: 80256.00, interest-and-bank-charges: -1242.00, shareholders: 0.00, dividends-paid: 0.00, intercompany-settlements: 0.00}
+
+taxes:
+  vat_rates: {"2025-01": 0.19, "2025-08": 0.21}
+  profit_rate: 0.16
+  dividend_rate: 0.16
+  # User-approved assumption: standard VAT, with supplier VAT fully deductible.
+  # Applies to historical net presentation and forecast seeding: 19% through
+  # July 2025, 21% thereafter. Exact monthly accounting data supersedes estimates.
+  # Source: user confirmation in chat and approval of the all-month net display.
+  # The PDF alone does not establish this VAT split; original cash is retained.
+  reported_cash_seed_basis: "gross-standard"
+  checkpoints:
+    "2026-01":
+      source: "Explicit zero opening tax-state assumptions; replace with accounting state when supplied"
+      kind: "assumption"
+      vat_credit: 0.00
+      profit_loss: 0.00
+      payments: {}
+
+# Positive payment magnitudes, keyed by payment month, with source and either
+# total (Taxes only), or profit/dividend/other components; vat is separate.
+tax_payments: {}
+
+# Gross positive distributions keyed by event month, each with gross and source.
+dividends: {}

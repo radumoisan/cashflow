@@ -4,3 +4,4 @@ __pycache__/
 .coverage
 dashboard.html
 .dashboard.html.*.tmp
+.cashflow.yaml.*.tmp

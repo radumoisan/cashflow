@@ -9,7 +9,8 @@ import re
 import sys
 import tempfile
 from collections import Counter
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from string import Template
@@ -29,10 +30,12 @@ MAX_MONEY_INTEGER_DIGITS = 256
 # Annual Keez totals aggregate unrounded values while the PDF exposes whole RON.
 ACCOUNTING_ROUNDING_TOLERANCE = Decimal("6")
 MONTH_PATTERN = re.compile(r"^(\d{4})-(\d{2})$")
-ALLOWED_TYPES = {"inflow", "outflow"}
 ACTIVITY_ORDER = ("operating", "investing", "financing")
 ALLOWED_ACTIVITIES = set(ACTIVITY_ORDER)
-ALLOWED_DASHBOARD_MODES = {"actuals", "projection"}
+ROW_ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+MAX_TIMELINE_MONTHS = 1200
+DERIVED_ROWS = {"vat": "vat", "taxes": "taxes", "dividends-paid": "dividends"}
+TAX_COMPONENTS = {"vat", "profit", "dividend", "other"}
 
 
 class ConfigError(ValueError):
@@ -121,56 +124,94 @@ class Settings:
     start_month: int
     projection_months: int
     initial_balance: Decimal
-    dashboard_mode: str
-    actuals_file: str
+    history_start: int
 
 
 @dataclass(frozen=True)
-class Category:
+class Row:
     id: str
     name: str
     activity: str
+    forecast: str
+    profit_weight: Decimal
+    seed: Decimal | None
+    seed_source: str
+    overrides: dict[int, Decimal]
 
 
 @dataclass(frozen=True)
-class RecurringEntry:
-    id: str
-    name: str
-    type: str
-    amount: Decimal
-    start_month: int
-    end_month: int | None
-    category: str
+class ActualMonth:
+    source: str
+    basis: str
+    values: dict[str, Decimal]
+    opening_balance: Decimal | None
+    closing_balance: Decimal
+    note: str
 
 
 @dataclass(frozen=True)
-class EventEntry:
-    id: str
-    name: str
-    type: str
-    amount: Decimal
-    month: int
-    category: str
+class TaxCheckpoint:
+    source: str
+    kind: str
+    vat_credit: Decimal
+    profit_loss: Decimal
+    payments: dict[int, dict[str, Decimal]]
+
+
+@dataclass(frozen=True)
+class TaxRules:
+    vat_rates: tuple[tuple[int, Decimal], ...]
+    profit_rate: Decimal
+    dividend_rate: Decimal
+    reported_cash_seed_basis: str
+    checkpoints: dict[int, TaxCheckpoint]
+
+
+@dataclass(frozen=True)
+class SuppliedPayment:
+    source: str
+    amounts: dict[str, Decimal]
+
+
+@dataclass(frozen=True)
+class Dividend:
+    gross: Decimal
+    source: str
 
 
 @dataclass(frozen=True)
 class Config:
     settings: Settings
-    categories: tuple[Category, ...]
-    recurring: tuple[RecurringEntry, ...]
-    events: tuple[EventEntry, ...]
+    rows: tuple[Row, ...]
+    actuals: dict[int, ActualMonth]
+    taxes: TaxRules
+    tax_payments: dict[int, SuppliedPayment]
+    dividends: dict[int, Dividend]
+
+    @property
+    def actual_through(self) -> int:
+        return max(self.actuals, default=self.settings.history_start - 1)
 
 
 @dataclass(frozen=True)
-class Contribution:
+class CellResult:
+    value: Decimal
+    provenance: str
+    editable: bool = False
+    note: str = ""
+    override: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectedRow:
     id: str
     name: str
-    type: str
-    amount: Decimal
-    category_id: str
-    category: str
     activity: str
-    kind: str
+    cells: tuple[CellResult, ...]
+
+    @property
+    def values(self) -> tuple[Decimal, ...]:
+        return tuple(cell.value for cell in self.cells)
 
 
 @dataclass(frozen=True)
@@ -181,14 +222,20 @@ class MonthResult:
     outflows: Decimal
     net: Decimal
     closing_balance: Decimal
-    contributions: tuple[Contribution, ...]
+    provenance: str = "derived"
+    opening_note: str = ""
+    closing_note: str = ""
 
 
 @dataclass(frozen=True)
 class Projection:
+    """Cash timeline with net-presented rows; original actuals remain in Config."""
+
     settings: Settings
-    categories: tuple[Category, ...]
+    rows: tuple[ProjectedRow, ...]
     months: tuple[MonthResult, ...]
+    actual_through: int
+    tax_details: tuple[dict[str, str], ...]
 
     @property
     def trough(self) -> MonthResult:
@@ -259,6 +306,49 @@ class ReconciliationDifference:
     scope: str
     period: str
     difference: Decimal
+
+
+@dataclass(frozen=True)
+class MoneyCell:
+    """A source amount and its engine-formatted display currencies."""
+
+    source: str
+    ron: str
+    eur: str
+    provenance: str = "derived"
+    editable: bool = False
+    note: str = ""
+    override: str | None = None
+
+
+@dataclass(frozen=True)
+class ReportRow:
+    id: str
+    name: str
+    cells: tuple[MoneyCell, ...]
+
+
+@dataclass(frozen=True)
+class ReportGroup:
+    id: str
+    name: str
+    rows: tuple[ReportRow, ...]
+    subtotal: ReportRow
+
+
+@dataclass(frozen=True)
+class ReportView:
+    """Presentation-ready report values shared by the HTML and HTTP views."""
+
+    mode: str
+    currency: str
+    months: tuple[str, ...]
+    opening_balance: ReportRow
+    activity_groups: tuple[ReportGroup, ...]
+    closing_balance: ReportRow
+    summary: dict[str, MoneyCell | str | int]
+    navigation: dict[str, str | None] = field(default_factory=dict)
+    tax_details: tuple[dict[str, str], ...] = ()
 
 
 def parse_month(value: Any, path: str) -> int:
@@ -340,204 +430,326 @@ def _require_decimal(value: Any, path: str) -> Decimal:
     return amount
 
 
-def _parse_common_entry(
-    value: dict[str, Any], path: str
-) -> tuple[str, str, str, Decimal, str]:
-    entry_id = _require_text(value["id"], f"{path}.id")
-    name = _require_text(value["name"], f"{path}.name")
-    entry_type = value["type"]
-    if not isinstance(entry_type, str) or entry_type not in ALLOWED_TYPES:
-        raise ConfigError(f"{path}.type must be 'inflow' or 'outflow'")
-    amount = _require_decimal(value["amount"], f"{path}.amount")
-    if amount <= ZERO:
-        raise ConfigError(f"{path}.amount must be positive")
-    category = _require_text(value["category"], f"{path}.category")
-    return entry_id, name, entry_type, amount, category
-
-
 def validate_config(raw: Any) -> Config:
     root = _require_mapping(raw, "cashflow")
-    root_keys = {"settings", "categories", "recurring", "events"}
+    root_keys = {"schema_version", "settings", "rows", "actuals", "taxes", "tax_payments", "dividends"}
     _check_keys(root, root_keys, root_keys, "cashflow")
-
+    if type(root["schema_version"]) is not int or root["schema_version"] != 2:
+        raise ConfigError("schema_version must be 2")
     settings_raw = _require_mapping(root["settings"], "settings")
     settings_keys = {
-        "company_name",
-        "registration_number",
-        "currency",
-        "ron_per_eur",
-        "start_date",
-        "projection_months",
-        "initial_balance",
-        "dashboard_mode",
-        "actuals_file",
+        "company_name", "registration_number", "currency", "ron_per_eur",
+        "start_date", "projection_months", "initial_balance", "history_start",
     }
     _check_keys(settings_raw, settings_keys, settings_keys, "settings")
-
-    company_name = _require_text(
-        settings_raw["company_name"], "settings.company_name"
-    )
-    registration_number = _require_text(
-        settings_raw["registration_number"], "settings.registration_number"
-    )
+    company_name = _require_text(settings_raw["company_name"], "settings.company_name")
+    registration_number = _require_text(settings_raw["registration_number"], "settings.registration_number")
     currency = _require_text(settings_raw["currency"], "settings.currency")
-    if currency not in {"RON", "EUR"}:
-        raise ConfigError("settings.currency must be 'RON' or 'EUR'")
-    ron_per_eur = _require_decimal(
-        settings_raw["ron_per_eur"], "settings.ron_per_eur"
-    )
+    if currency != "RON":
+        raise ConfigError("settings.currency must be RON; EUR is display-only")
+    ron_per_eur = _require_decimal(settings_raw["ron_per_eur"], "settings.ron_per_eur")
     if ron_per_eur <= ZERO:
         raise ConfigError("settings.ron_per_eur must be positive")
     start_month = parse_month(settings_raw["start_date"], "settings.start_date")
+    history_start = parse_month(settings_raw["history_start"], "settings.history_start")
     projection_months = settings_raw["projection_months"]
-    if (
-        isinstance(projection_months, bool)
-        or not isinstance(projection_months, int)
-        or projection_months != 12
-    ):
+    if type(projection_months) is not int or projection_months != 12:
         raise ConfigError("settings.projection_months must be exactly 12")
-    final_year = (start_month + projection_months - 1) // 12
-    if final_year > 9999:
-        raise ConfigError("settings projection window must end by 9999-12")
-    initial_balance = _require_decimal(
-        settings_raw["initial_balance"], "settings.initial_balance"
+    initial_balance = _require_decimal(settings_raw["initial_balance"], "settings.initial_balance")
+    settings = Settings(
+        company_name, registration_number, currency, ron_per_eur,
+        start_month, projection_months, initial_balance, history_start,
     )
-    dashboard_mode = settings_raw["dashboard_mode"]
-    if (
-        not isinstance(dashboard_mode, str)
-        or dashboard_mode not in ALLOWED_DASHBOARD_MODES
-    ):
-        raise ConfigError("settings.dashboard_mode must be 'actuals' or 'projection'")
-    actuals_file = _require_text(settings_raw["actuals_file"], "settings.actuals_file")
-    if Path(actuals_file).is_absolute() or ".." in Path(actuals_file).parts:
-        raise ConfigError("settings.actuals_file must be a relative path inside the project")
+    validate_window(settings, format_month(start_month))
 
-    categories: list[Category] = []
-    category_keys = {"id", "name", "activity"}
-    for index, item in enumerate(_require_list(root["categories"], "categories")):
-        path = f"categories[{index}]"
-        category = _require_mapping(item, path)
-        _check_keys(category, category_keys, category_keys, path)
-        category_id = _require_text(category["id"], f"{path}.id")
-        category_name = _require_text(category["name"], f"{path}.name")
-        activity = category["activity"]
+    def dated(mapping: Any, path: str) -> dict[int, Any]:
+        result = {}
+        for key, value in _require_mapping(mapping, path).items():
+            month = parse_month(key, f"{path} key")
+            if not history_start <= month < timeline_end(settings):
+                raise ConfigError(f"{path}[{key}] is outside the supported timeline")
+            result[month] = value
+        return result
+
+    rows: list[Row] = []
+    row_keys = {"id", "name", "activity", "forecast", "profit_weight", "seed", "overrides"}
+    for index, item in enumerate(_require_list(root["rows"], "rows")):
+        path = f"rows[{index}]"
+        row = _require_mapping(item, path)
+        _check_keys(row, row_keys, row_keys, path)
+        row_id = _require_text(row["id"], f"{path}.id")
+        if not ROW_ID_PATTERN.fullmatch(row_id):
+            raise ConfigError(f"{path}.id must be lowercase hyphenated")
+        if row_id in {"opening-balance", "closing-balance", "subtotal"} or row_id.startswith("subtotal-"):
+            raise ConfigError(f"{path}.id is reserved")
+        name = _require_text(row["name"], f"{path}.name")
+        activity = row["activity"]
         if not isinstance(activity, str) or activity not in ALLOWED_ACTIVITIES:
-            raise ConfigError(
-                f"{path}.activity must be 'operating', 'investing', or 'financing'"
-            )
-        categories.append(Category(category_id, category_name, activity))
+            raise ConfigError(f"{path}.activity must be 'operating', 'investing', or 'financing'")
+        method = _require_text(row["forecast"], f"{path}.forecast")
+        if method not in {"carry", "zero", *DERIVED_ROWS.values()}:
+            raise ConfigError(f"{path}.forecast is not a supported method")
+        if row_id in DERIVED_ROWS and method != DERIVED_ROWS[row_id]:
+            raise ConfigError(f"{row_id} must be derived using {DERIVED_ROWS[row_id]}")
+        if method not in {"carry", "zero"} and DERIVED_ROWS.get(row_id) != method:
+            raise ConfigError(f"{path}.forecast uses a reserved derived method")
+        weight = _require_rate(row["profit_weight"], f"{path}.profit_weight")
+        if weight and (method not in {"carry", "zero"} or row_id in {
+            "advances", "fixed-assets", "short-term-debt", "shareholders", "intercompany-settlements",
+        }):
+            raise ConfigError(f"{row_id} cannot contribute to the profit proxy")
+        seed, seed_source = None, ""
+        if row["seed"] is not None:
+            seed_raw = _require_mapping(row["seed"], f"{path}.seed")
+            _check_keys(seed_raw, {"value", "source"}, {"value", "source"}, f"{path}.seed")
+            seed = _require_decimal(seed_raw["value"], f"{path}.seed.value")
+            seed_source = _require_text(seed_raw["source"], f"{path}.seed.source")
+            if method != "carry":
+                raise ConfigError(f"{path}.seed is only for recurring rows")
+        overrides = {
+            month: _require_decimal(value, f"{path}.overrides[{format_month(month)}]")
+            for month, value in dated(row["overrides"], f"{path}.overrides").items()
+        }
+        if method not in {"carry", "zero"} and overrides:
+            raise ConfigError(f"{row_id} is derived and cannot have overrides")
+        rows.append(Row(row_id, name, activity, method, weight, seed, seed_source, overrides))
 
-    category_ids = [category.id for category in categories]
-    duplicate_category_ids = sorted(
-        category_id
-        for category_id, count in Counter(category_ids).items()
-        if count > 1
-    )
-    if duplicate_category_ids:
-        raise ConfigError(
-            f"category ids must be unique: {', '.join(duplicate_category_ids)}"
-        )
-    known_categories = set(category_ids)
-
-    recurring_entries: list[RecurringEntry] = []
-    recurring_keys = {
-        "id",
-        "name",
-        "type",
-        "amount",
-        "start_date",
-        "end_date",
-        "category",
-    }
-    for index, item in enumerate(_require_list(root["recurring"], "recurring")):
-        path = f"recurring[{index}]"
-        entry = _require_mapping(item, path)
-        _check_keys(entry, recurring_keys, recurring_keys, path)
-        entry_id, name, entry_type, amount, category = _parse_common_entry(
-            entry, path
-        )
-        if category not in known_categories:
-            raise ConfigError(f"{path}.category references unknown category {category!r}")
-        entry_start = parse_month(entry["start_date"], f"{path}.start_date")
-        end_value = entry["end_date"]
-        entry_end = (
-            None
-            if end_value is None
-            else parse_month(end_value, f"{path}.end_date")
-        )
-        if entry_end is not None and entry_end < entry_start:
-            raise ConfigError(f"{path}.end_date cannot be before start_date")
-        recurring_entries.append(
-            RecurringEntry(
-                entry_id,
-                name,
-                entry_type,
-                amount,
-                entry_start,
-                entry_end,
-                category,
-            )
-        )
-
-    event_entries: list[EventEntry] = []
-    event_keys = {"id", "name", "type", "amount", "date", "category"}
-    for index, item in enumerate(_require_list(root["events"], "events")):
-        path = f"events[{index}]"
-        entry = _require_mapping(item, path)
-        _check_keys(entry, event_keys, event_keys, path)
-        entry_id, name, entry_type, amount, category = _parse_common_entry(
-            entry, path
-        )
-        if category not in known_categories:
-            raise ConfigError(f"{path}.category references unknown category {category!r}")
-        event_entries.append(
-            EventEntry(
-                entry_id,
-                name,
-                entry_type,
-                amount,
-                parse_month(entry["date"], f"{path}.date"),
-                category,
-            )
-        )
-
-    all_ids = [entry.id for entry in recurring_entries]
-    all_ids.extend(entry.id for entry in event_entries)
-    duplicate_ids = sorted(
-        entry_id for entry_id, count in Counter(all_ids).items() if count > 1
-    )
+    duplicate_ids = sorted(row_id for row_id, count in Counter(row.id for row in rows).items() if count > 1)
     if duplicate_ids:
-        raise ConfigError(f"entry ids must be unique: {', '.join(duplicate_ids)}")
+        raise ConfigError(f"row ids must be unique: {', '.join(duplicate_ids)}")
+    ids = {row.id for row in rows}
+    if not {"clients", "suppliers", *DERIVED_ROWS}.issubset(ids):
+        raise ConfigError("rows must include clients, suppliers, vat, taxes, and dividends-paid")
+    for row in rows:
+        if row.id in {"clients", "suppliers"} and row.forecast != "carry":
+            raise ConfigError(f"{row.id} must use carry forecasting")
 
-    return Config(
-        Settings(
-            company_name,
-            registration_number,
-            currency,
-            ron_per_eur,
-            start_month,
-            projection_months,
-            initial_balance,
-            dashboard_mode,
-            actuals_file,
-        ),
-        tuple(categories),
-        tuple(recurring_entries),
-        tuple(event_entries),
-    )
+    actuals = {}
+    for month, item in dated(root["actuals"], "actuals").items():
+        path = f"actuals[{format_month(month)}]"
+        record = _require_mapping(item, path)
+        required = {"source", "basis", "values", "closing_balance"}
+        _check_keys(record, required, required | {"opening_balance", "note"}, path)
+        source = _require_text(record["source"], f"{path}.source")
+        basis = _require_text(record["basis"], f"{path}.basis")
+        if basis not in {"reported", "net"}:
+            raise ConfigError(f"{path}.basis must be reported or net")
+        amounts = _require_mapping(record["values"], f"{path}.values")
+        _check_keys(amounts, ids, ids, f"{path}.values (complete months only)")
+        actuals[month] = ActualMonth(
+            source, basis,
+            {key: _require_decimal(value, f"{path}.values.{key}") for key, value in amounts.items()},
+            _require_decimal(record["opening_balance"], f"{path}.opening_balance") if "opening_balance" in record else None,
+            _require_decimal(record["closing_balance"], f"{path}.closing_balance"),
+            _require_text(record["note"], f"{path}.note") if "note" in record else "",
+        )
+    if actuals and set(actuals) != set(range(history_start, max(actuals) + 1)):
+        raise ConfigError("actuals must be contiguous complete months from history_start")
+
+    tax_raw = _require_mapping(root["taxes"], "taxes")
+    tax_keys = {"vat_rates", "profit_rate", "dividend_rate", "reported_cash_seed_basis", "checkpoints"}
+    _check_keys(tax_raw, tax_keys, tax_keys, "taxes")
+    rates = tuple(sorted(
+        (parse_month(key, "taxes.vat_rates key"), _require_rate(value, "taxes.vat_rates value"))
+        for key, value in _require_mapping(tax_raw["vat_rates"], "taxes.vat_rates").items()
+    ))
+    if not rates or rates[0][0] > history_start:
+        raise ConfigError("VAT rate schedule must cover history_start")
+    seed_basis = _require_text(tax_raw["reported_cash_seed_basis"], "taxes.reported_cash_seed_basis")
+    if seed_basis not in {"gross-standard", "net"}:
+        raise ConfigError("reported_cash_seed_basis must be gross-standard or net")
+    checkpoints = {}
+    for month, item in dated(tax_raw["checkpoints"], "taxes.checkpoints").items():
+        path = f"taxes.checkpoints[{format_month(month)}]"
+        checkpoint = _require_mapping(item, path)
+        keys = {"source", "kind", "vat_credit", "profit_loss", "payments"}
+        _check_keys(checkpoint, keys, keys, path)
+        kind = _require_text(checkpoint["kind"], f"{path}.kind")
+        if kind not in {"assumption", "accounting"}:
+            raise ConfigError(f"{path}.kind must be assumption or accounting")
+        payments = {}
+        for due, payment in dated(checkpoint["payments"], f"{path}.payments").items():
+            if due < month:
+                raise ConfigError(f"{path}.payments cannot be due before the checkpoint")
+            payments[due] = _payment_amounts(payment, f"{path}.payments", allow_total=False)
+        checkpoints[month] = TaxCheckpoint(
+            _require_text(checkpoint["source"], f"{path}.source"), kind,
+            _nonnegative(checkpoint["vat_credit"], f"{path}.vat_credit"),
+            _nonnegative(checkpoint["profit_loss"], f"{path}.profit_loss"), payments,
+        )
+    forecast_start = max(actuals, default=history_start - 1) + 1
+    if not checkpoints or min(checkpoints) > forecast_start:
+        raise ConfigError("taxes.checkpoints must establish state by the first forecast month")
+    for month, actual in actuals.items():
+        if actual.basis == "reported" and month >= min(checkpoints):
+            raise ConfigError("actuals in the tax-model timeline must use net basis; normalize cash reports explicitly")
+
+    supplied = {}
+    for month, item in dated(root["tax_payments"], "tax_payments").items():
+        record = _require_mapping(item, "tax_payments[]")
+        _check_keys(record, {"source"}, {"source", "total", *TAX_COMPONENTS}, "tax_payments[]")
+        supplied[month] = SuppliedPayment(
+            _require_text(record["source"], "tax_payments[].source"),
+            _payment_amounts({key: value for key, value in record.items() if key != "source"}, "tax_payments[]"),
+        )
+    dividends = {}
+    for month, item in dated(root["dividends"], "dividends").items():
+        record = _require_mapping(item, "dividends[]")
+        _check_keys(record, {"gross", "source"}, {"gross", "source"}, "dividends[]")
+        if month < min(checkpoints):
+            raise ConfigError("dividend events require initialized tax state")
+        gross = _nonnegative(record["gross"], "dividends[].gross")
+        if gross == ZERO:
+            raise ConfigError("dividends[].gross must be positive; remove a cancelled event")
+        dividends[month] = Dividend(gross, _require_text(record["source"], "dividends[].source"))
+    dividend_rate = _require_rate(tax_raw["dividend_rate"], "taxes.dividend_rate")
+    for month, actual in actuals.items():
+        if actual.basis != "net" or actual.values["dividends-paid"] == ZERO:
+            continue
+        event = dividends.get(month)
+        next_payment = supplied.get(month + 1)
+        exact_next = month + 1 in checkpoints or (
+            next_payment is not None and bool({"dividend", "total"} & next_payment.amounts.keys())
+        )
+        with localcontext() as context:
+            context.prec = MAX_MONEY_INTEGER_DIGITS + 50
+            matches = event is not None and actual.values["dividends-paid"] == -(
+                event.gross - _rounded_money(event.gross * dividend_rate)
+            )
+        if not matches and not exact_next:
+            raise ConfigError(
+                f"actual dividend payment in {format_month(month)} requires a matching gross event "
+                "or an explicit following-month tax payment/checkpoint"
+            )
+    return Config(settings, tuple(rows), actuals, TaxRules(
+        rates, _require_rate(tax_raw["profit_rate"], "taxes.profit_rate"),
+        dividend_rate, seed_basis, checkpoints,
+    ), supplied, dividends)
+
+
+def _nonnegative(value: Any, path: str) -> Decimal:
+    amount = _require_decimal(value, path)
+    if amount < ZERO:
+        raise ConfigError(f"{path} must be nonnegative")
+    return amount
+
+
+def _require_rate(value: Any, path: str) -> Decimal:
+    rate = _nonnegative(value, path)
+    if rate > 1:
+        raise ConfigError(f"{path} must be between 0 and 1")
+    return rate
+
+
+def _payment_amounts(value: Any, path: str, *, allow_total: bool = True) -> dict[str, Decimal]:
+    record = _require_mapping(value, path)
+    _check_keys(record, set(), TAX_COMPONENTS | ({"total"} if allow_total else set()), path)
+    if not record:
+        raise ConfigError(f"{path} requires a payment component")
+    if "total" in record and (set(record) - {"total", "vat"}):
+        raise ConfigError(f"{path} cannot combine total and Taxes components")
+    return {key: _nonnegative(amount, f"{path}.{key}") for key, amount in record.items()}
+
+
+def timeline_end(settings: Settings) -> int:
+    return min(settings.history_start + MAX_TIMELINE_MONTHS, 10000 * 12)
+
+
+def validate_window(settings: Settings, start: str | None) -> int:
+    month = settings.start_month if start is None else parse_month(start, "start")
+    if not settings.history_start <= month <= timeline_end(settings) - 12:
+        raise ConfigError("start must select twelve months inside the supported timeline")
+    return month
+
+
+def replace_input(
+    raw: Any,
+    *,
+    row_id: str | None = None,
+    month: str | None = None,
+    value: Any = None,
+) -> dict[str, Any]:
+    """Return a copy with one forecast override set, or cleared with None."""
+    config = validate_config(raw)
+    target = parse_month(month, "replace_input.month")
+    row = next((row for row in config.rows if row.id == row_id), None)
+    if row is None:
+        raise ConfigError(f"replace_input references unknown row {row_id!r}")
+    if row.forecast not in {"carry", "zero"}:
+        raise ConfigError(f"{row_id} is derived and read-only")
+    if not config.actual_through < target < timeline_end(config.settings):
+        raise ConfigError("only forecast months inside the supported timeline are editable")
+    updated = deepcopy(raw)
+    candidate = next(row for row in updated["rows"] if row["id"] == row_id)
+    if value is None:
+        candidate["overrides"].pop(month, None)
+    else:
+        candidate["overrides"][month] = _require_decimal(value, "replace_input.value")
+    validate_config(updated)
+    return updated
+
+
+def import_actual_month(raw: Any, month: str, record: dict[str, Any]) -> dict[str, Any]:
+    """Validate a complete accounting update; incomplete imports never become facts."""
+    validate_config(raw)
+    updated = deepcopy(raw)
+    updated["actuals"][month] = deepcopy(record)
+    config = validate_config(updated)
+    evaluate_config(config)
+    return updated
+
+
+def normalize_cash_actual(
+    record: dict[str, Any], *, clients_vat: Any, suppliers_vat: Any
+) -> dict[str, Any]:
+    """Reclassify reported cash using supplied signed VAT components, not a guessed rate.
+
+    The source cash total and reported balances are preserved. Pass the returned
+    complete record to import_actual_month for scenario-wide validation.
+    """
+    record = _require_mapping(record, "accounting month")
+    if record.get("basis") != "reported":
+        raise ConfigError("normalization requires reported cash basis")
+    updated = deepcopy(record)
+    values = _require_mapping(updated.get("values"), "accounting month.values")
+    client_cash = _require_decimal(values.get("clients"), "accounting month.clients")
+    supplier_cash = _require_decimal(values.get("suppliers"), "accounting month.suppliers")
+    remittance = _require_decimal(values.get("vat"), "accounting month.vat")
+    output_vat = _require_decimal(clients_vat, "clients_vat")
+    input_vat = _require_decimal(suppliers_vat, "suppliers_vat")
+    with localcontext() as context:
+        context.prec = MAX_MONEY_INTEGER_DIGITS + 50
+        values["clients"] = client_cash - output_vat
+        values["suppliers"] = supplier_cash - input_vat
+        values["vat"] = remittance + output_vat + input_vat
+    updated["basis"] = "net"
+    updated["note"] = (
+        f"{record.get('note', '')} Normalized from reported cash using supplied signed VAT components: "
+        f"Clients cash {client_cash}, VAT {output_vat}; Suppliers cash {supplier_cash}, VAT {input_vat}; "
+        f"tax-authority VAT cash {remittance}. Source total and reported balances preserved."
+    ).strip()
+    return updated
+
+
+def load_config_bytes(data: bytes, path: Path) -> Config:
+    """Strictly parse and validate configuration bytes from *path*."""
+    try:
+        raw = yaml.load(data.decode("utf-8"), Loader=DecimalSafeLoader)
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"could not decode {path} as UTF-8") from exc
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"could not parse {path}: {exc}") from exc
+    return validate_config(raw)
 
 
 def load_config(path: Path) -> Config:
     try:
-        with path.open("r", encoding="utf-8") as source:
-            raw = yaml.load(source, Loader=DecimalSafeLoader)
+        data = path.read_bytes()
     except FileNotFoundError as exc:
         raise ConfigError(f"input file not found: {path}") from exc
     except OSError as exc:
         raise ConfigError(f"could not read {path}: {exc}") from exc
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"could not parse {path}: {exc}") from exc
-    return validate_config(raw)
+    return load_config_bytes(data, path)
 
 
 def _parse_historical_series(value: Any, path: str) -> HistoricalSeries:
@@ -714,88 +926,222 @@ def load_actuals(path: Path) -> ActualsReport:
     return validate_actuals(raw)
 
 
-def calculate_projection(config: Config) -> Projection:
-    categories_by_id = {category.id: category for category in config.categories}
-    monetary_values = [config.settings.initial_balance]
-    monetary_values.extend(entry.amount for entry in config.recurring)
-    monetary_values.extend(entry.amount for entry in config.events)
-    maximum_terms = 1 + config.settings.projection_months * (
-        len(config.recurring) + len(config.events)
-    )
+def vat_rate_at(rules: TaxRules, month: int) -> Decimal:
+    return next(rate for effective, rate in reversed(rules.vat_rates) if effective <= month)
 
+
+def _model_end(config: Config, start: int) -> int:
+    dates = [config.actual_through, *config.dividends, *config.tax_payments, *config.taxes.checkpoints]
+    dates.extend(month for row in config.rows for month in row.overrides)
+    dates.extend(month for checkpoint in config.taxes.checkpoints.values() for month in checkpoint.payments)
+    return min(timeline_end(config.settings), max(start + 12, max(dates) + 2))
+
+
+def _net_actual_presentation(
+    cells: dict[str, CellResult], rate: Decimal, currency: str,
+) -> dict[str, CellResult]:
+    """Present reported cash net, transferring its estimated VAT without losing cents."""
+    displayed = dict(cells)
     with localcontext() as context:
-        context.prec = _decimal_precision(monetary_values, maximum_terms)
+        context.prec = _decimal_precision([cells[key].value for key in ("clients", "suppliers", "vat")]) + 20
+        components = {}
+        for row_id in ("clients", "suppliers"):
+            original = cells[row_id]
+            net = _rounded_money(original.value / (1 + rate))
+            # Use the residual, not VAT recomputed from rounded net: each cash
+            # payment must retain all its source cents during reclassification.
+            components[row_id] = original.value - net
+            deduction = "; supplier VAT assumed fully deductible" if row_id == "suppliers" else ""
+            displayed[row_id] = CellResult(
+                net, "actual-net-estimate", note=(
+                    f"Estimated net presentation of closed actual: original reported cash "
+                    f"{format_currency(original.value, currency)}; assumed VAT {rate:.0%}{deduction}; "
+                    f"signed VAT portion {format_currency(components[row_id], currency)} moved to VAT. "
+                    f"{original.note}"
+                ),
+            )
+        original_vat = cells["vat"]
+        displayed["vat"] = CellResult(
+            original_vat.value + components["clients"] + components["suppliers"],
+            "actual-net-estimate", note=(
+                f"Estimated VAT presentation of closed actual: original reported VAT cash "
+                f"{format_currency(original_vat.value, currency)} plus signed VAT portions from "
+                f"Clients {format_currency(components['clients'], currency)} and "
+                f"Suppliers {format_currency(components['suppliers'], currency)}. "
+                f"Assumed VAT {rate:.0%}; supplier VAT assumed fully deductible. "
+                f"{original_vat.note}"
+            ),
+        )
+    return displayed
+
+
+def calculate_projection(config: Config, start: str | None = None) -> Projection:
+    """Evaluate the full dated timeline, then select a twelve-month view."""
+    view_start = validate_window(config.settings, start)
+    end = _model_end(config, view_start)
+    # All accepted amounts have <=256 integer digits. Leave room for up to 1200
+    # months of sums, currency conversion, and weighted tax calculations.
+    with localcontext() as context:
+        context.prec = MAX_MONEY_INTEGER_DIGITS + 50
         balance = config.settings.initial_balance
+        carry = {row.id: row.seed for row in config.rows}
+        carry_notes = {row.id: f"Starting assumption: {row.seed_source}" for row in config.rows}
+        cells: dict[str, list[CellResult]] = {row.id: [] for row in config.rows}
         results: list[MonthResult] = []
+        details: list[dict[str, str]] = []
+        vat_credit = profit_loss = ZERO
+        payments: dict[int, dict[str, Decimal]] = {}
+        state_source = "Historical report; forecast tax state not yet initialized"
+        tax_start = min(config.taxes.checkpoints)
 
-        for offset in range(config.settings.projection_months):
-            month = config.settings.start_month + offset
-            contributions: list[Contribution] = []
-
-            for entry in config.recurring:
-                if entry.start_month <= month and (
-                    entry.end_month is None or entry.end_month >= month
-                ):
-                    category = categories_by_id[entry.category]
-                    contributions.append(
-                        Contribution(
-                            entry.id,
-                            entry.name,
-                            entry.type,
-                            entry.amount,
-                            category.id,
-                            category.name,
-                            category.activity,
-                            "Recurring",
+        for month in range(config.settings.history_start, end):
+            date = format_month(month)
+            actual = config.actuals.get(month)
+            checkpoint = config.taxes.checkpoints.get(month)
+            if checkpoint:
+                vat_credit, profit_loss = checkpoint.vat_credit, checkpoint.profit_loss
+                payments = deepcopy(checkpoint.payments)
+                state_source = f"{checkpoint.kind.title()} at {date}: {checkpoint.source}"
+            amounts: dict[str, Decimal] = {}
+            month_cells: dict[str, CellResult] = {}
+            for row in config.rows:
+                if actual:
+                    value = actual.values[row.id]
+                    basis_note = "Reported cash (VAT-inclusive where applicable)" if actual.basis == "reported" else "Net Clients/Suppliers; VAT row includes VAT cash activity"
+                    if actual.basis == "reported" and row.id in {"clients", "suppliers"} and config.taxes.reported_cash_seed_basis == "net":
+                        basis_note = "Reported amount assumed net by configuration"
+                    if actual.basis == "reported" and row.id in {"shareholders", "dividends-paid"}:
+                        basis_note += "; historical Shareholders is unsplit; Dividends Paid adds no separate reclassification"
+                    month_cells[row.id] = CellResult(value, "actual", note=f"Actual: {actual.source}. {basis_note}. {actual.note}")
+                    amounts[row.id] = value
+                    if row.forecast == "carry":
+                        carry[row.id] = value
+                        carry_notes[row.id] = f"Carried from actual {date}: {actual.source}"
+                        if actual.basis == "reported" and row.id in {"clients", "suppliers"}:
+                            if config.taxes.reported_cash_seed_basis == "gross-standard":
+                                carry[row.id] = _rounded_money(value / (1 + vat_rate_at(config.taxes, month)))
+                                carry_notes[row.id] += "; estimated net conversion of reported cash at the standard VAT rate, not an accounting net figure"
+                            else:
+                                carry_notes[row.id] += "; reported amount assumed net by configuration"
+                elif row.forecast in {"carry", "zero"}:
+                    if month in row.overrides:
+                        value = row.overrides[month]
+                        note = "Manual override; clear this cell to restore estimation"
+                        month_cells[row.id] = CellResult(value, "override", True, note, f"{value:.2f}")
+                        if row.forecast == "carry":
+                            carry[row.id], carry_notes[row.id] = value, f"Carried from override {date}"
+                    else:
+                        value = carry[row.id] if row.forecast == "carry" else ZERO
+                        if value is None:
+                            raise ConfigError(f"{row.id} needs an explicit net seed before forecasting {date}")
+                        note = carry_notes[row.id] if row.forecast == "carry" else "No event planned; this row defaults to zero"
+                        month_cells[row.id] = CellResult(value, "estimate", True, note)
+                    amounts[row.id] = value
+                    if row.id in {"clients", "suppliers"}:
+                        current = month_cells[row.id]
+                        month_cells[row.id] = CellResult(
+                            current.value, current.provenance, current.editable,
+                            current.note + "; net of VAT", current.override,
                         )
-                    )
 
-            for entry in config.events:
-                if entry.month == month:
-                    category = categories_by_id[entry.category]
-                    contributions.append(
-                        Contribution(
-                            entry.id,
-                            entry.name,
-                            entry.type,
-                            entry.amount,
-                            category.id,
-                            category.name,
-                            category.activity,
-                            "One-off event",
-                        )
-                    )
+            tax_detail = {"month": date, "state_source": state_source}
+            if month >= tax_start:
+                rate = vat_rate_at(config.taxes, month)
+                vat_activity = _rounded_money(amounts["clients"] * rate) + _rounded_money(amounts["suppliers"] * rate)
+                vat_accrual = max(vat_activity - vat_credit, ZERO)
+                vat_credit = max(vat_credit - vat_activity, ZERO)
+                proxy = _rounded_money(_sum_money([
+                    amounts[row.id] * row.profit_weight for row in config.rows if row.profit_weight
+                ]))
+                taxable = max(proxy - profit_loss, ZERO)
+                profit_loss = max(profit_loss - proxy, ZERO)
+                profit_accrual = _rounded_money(taxable * config.taxes.profit_rate)
+                event = config.dividends.get(month)
+                if actual and event:
+                    planned_net = -(event.gross - _rounded_money(event.gross * config.taxes.dividend_rate))
+                    if actual.values["dividends-paid"] != planned_net:
+                        # Actual cash supersedes a cancelled/changed forecast event.
+                        # Nonzero mismatches require explicit next-month state above.
+                        event = None
+                gross = event.gross if event else ZERO
+                withholding = _rounded_money(gross * config.taxes.dividend_rate)
+                next_due = payments.setdefault(month + 1, {})
+                for component, amount in (("vat", vat_accrual), ("profit", profit_accrual), ("dividend", withholding)):
+                    next_due[component] = next_due.get(component, ZERO) + amount
+                due = {component: payments.get(month, {}).get(component, ZERO) for component in TAX_COMPONENTS}
+                confirmed = config.tax_payments.get(month)
+                if confirmed:
+                    due.update(confirmed.amounts)
+                total_tax = due.get("total", due["profit"] + due["dividend"] + due["other"])
+                computed = {"vat": vat_activity - due["vat"], "taxes": -total_tax, "dividends-paid": -(gross - withholding)}
+                numeric_details = {
+                    "vat_activity": vat_activity, "vat_payment": due["vat"], "vat_credit": vat_credit,
+                    "vat_accrued": vat_accrual, "profit_proxy": proxy, "profit_loss": profit_loss,
+                    "profit_accrued": profit_accrual, "profit_payment": due["profit"],
+                    "dividend_withholding": withholding, "dividend_payment": due["dividend"],
+                    "other_payment": due["other"], "tax_payment_total": total_tax,
+                }
+                tax_detail.update({key: f"{value:.2f}" for key, value in numeric_details.items()})
+                tax_detail["payment_source"] = confirmed.source if confirmed else "Estimated payment schedule"
+                tax_detail["tax_components"] = "unallocated total" if "total" in due or actual else "scheduled components"
+                if not actual:
+                    amounts.update(computed)
+                    vat_note = f"VAT activity {format_number(vat_activity)} minus remittance {format_number(due['vat'])}; credit carried {format_number(vat_credit)}. {state_source}"
+                    if confirmed and "vat" in confirmed.amounts:
+                        vat_note += f". Confirmed remittance: {confirmed.source}"
+                    if confirmed and "total" in confirmed.amounts:
+                        taxes_note = f"Accountant-confirmed total: {confirmed.source}; replaces estimated components"
+                    else:
+                        taxes_note = f"Profit tax {format_number(due['profit'])}; dividend tax {format_number(due['dividend'])}; other {format_number(due['other'])}. Cash-flow proxy estimate; {state_source}"
+                        if confirmed:
+                            taxes_note += f". Confirmed components: {confirmed.source}"
+                    month_cells["vat"] = CellResult(computed["vat"], "derived", note=vat_note)
+                    month_cells["taxes"] = CellResult(computed["taxes"], "confirmed" if confirmed and "total" in confirmed.amounts else "derived", note=taxes_note)
+                    month_cells["dividends-paid"] = CellResult(computed["dividends-paid"], "derived", note=f"Gross dividend less withholding; {event.source}" if event else "No gross dividend event planned")
+                else:
+                    tax_detail["reported_tax_cash"] = f"{actual.values['taxes']:.2f}"
+                    tax_detail["reported_vat_cash"] = f"{actual.values['vat']:.2f}"
+                    tax_detail["payment_source"] = f"Actual cash rows take precedence: {actual.source}; carry state remains a proxy until an accounting checkpoint"
 
-            inflows = sum(
-                (item.amount for item in contributions if item.type == "inflow"),
-                ZERO,
-            )
-            outflows = sum(
-                (item.amount for item in contributions if item.type == "outflow"),
-                ZERO,
-            )
+            movements = list(amounts.values())
+            inflows = _sum_money([value for value in movements if value > ZERO])
+            outflows = _sum_money([-value for value in movements if value < ZERO])
             net = inflows - outflows
-            closing_balance = balance + net
-            results.append(
-                MonthResult(
-                    month,
-                    balance,
-                    inflows,
-                    outflows,
-                    net,
-                    closing_balance,
-                    tuple(contributions),
-                )
-            )
-            balance = closing_balance
+            opening = actual.opening_balance if actual and actual.opening_balance is not None else balance
+            closing = actual.closing_balance if actual else opening + net
+            opening_note = f"Rolled forward from {format_month(month - 1)}" if month > config.settings.history_start else "Dated starting cash balance"
+            closing_note = "Opening balance plus signed cash movements"
+            if actual:
+                opening_note = f"Reported opening balance: {actual.source}" if actual.opening_balance is not None else f"{actual.source}. " + opening_note
+                closing_note = f"Reported closing balance: {actual.source}"
+                if opening != balance:
+                    opening_note += f". Source reconciliation: reported opening differs from preceding balance by {format_number(opening - balance, signed=True)} RON"
+                if closing != opening + net:
+                    closing_note += f". Source reconciliation: closing differs from displayed row roll-forward by {format_number(closing - opening - net, signed=True)} RON"
+            if view_start <= month < view_start + 12:
+                # Source cash drives reconciliation and run rates above. Only
+                # its presentation is reclassified; no historical tax state is
+                # inferred from this assumed VAT split.
+                if actual and actual.basis == "reported" and config.taxes.reported_cash_seed_basis == "gross-standard":
+                    month_cells = _net_actual_presentation(
+                        month_cells, vat_rate_at(config.taxes, month), config.settings.currency,
+                    )
+                for row in config.rows:
+                    cells[row.id].append(month_cells[row.id])
+                results.append(MonthResult(month, opening, inflows, outflows, net, closing, "actual" if actual else "derived", opening_note, closing_note))
+                details.append(tax_detail)
+            balance = closing
 
-    return Projection(config.settings, config.categories, tuple(results))
+    return Projection(config.settings, tuple(
+        ProjectedRow(row.id, row.name, row.activity, tuple(cells[row.id])) for row in config.rows
+    ), tuple(results), config.actual_through, tuple(details))
 
 
 def _rounded_money(value: Decimal) -> Decimal:
     with localcontext() as context:
         context.prec = _decimal_precision([value])
-        return value.quantize(CENT, rounding=ROUND_HALF_UP)
+        rounded = value.quantize(CENT, rounding=ROUND_HALF_UP)
+        return rounded if rounded else ZERO
 
 
 def format_number(value: Decimal, *, signed: bool = False) -> str:
@@ -808,7 +1154,7 @@ def format_number(value: Decimal, *, signed: bool = False) -> str:
 def format_currency(value: Decimal, currency: str, *, signed: bool = False) -> str:
     rounded = _rounded_money(value)
     if rounded < ZERO:
-        return f"-{currency} {abs(rounded):,.2f}"
+        return f"-{currency} {rounded.copy_abs():,.2f}"
     if signed and rounded > ZERO:
         return f"+{currency} {rounded:,.2f}"
     return f"{currency} {rounded:,.2f}"
@@ -841,14 +1187,14 @@ def print_summary(projection: Projection, stream: TextIO = sys.stdout) -> None:
         average_value = average
     elif average < ZERO:
         average_label = "Average monthly burn"
-        average_value = abs(average)
+        average_value = average.copy_abs()
     else:
         average_label = "Average monthly change"
         average_value = ZERO
 
     print(file=stream)
     print(
-        f"Starting balance: {format_currency(projection.settings.initial_balance, currency)}",
+        f"Starting balance: {format_currency(projection.months[0].opening_balance, currency)}",
         file=stream,
     )
     print(
@@ -1050,6 +1396,34 @@ def reconcile_actuals(actuals: ActualsReport) -> tuple[ReconciliationDifference,
     return tuple(differences)
 
 
+def compare_cash_to_revenue(
+    actuals: ActualsReport, vat_rates: tuple[Decimal, ...]
+) -> tuple[dict[str, str], ...]:
+    """Diagnostic evidence only: revenue and cash need not share payment timing."""
+    if len(vat_rates) != 12:
+        raise ConfigError("reference VAT comparison requires twelve monthly rates")
+    clients = next(
+        row for section in actuals.cashflow.sections
+        for row in section.rows if row.id == "clients"
+    )
+    revenue = next(section for section in actuals.profit.sections if section.id == "revenues")
+    result = []
+    for index, rate in enumerate(vat_rates):
+        cash = clients.values.months[index]
+        net = revenue.reported.months[index]
+        with localcontext() as context:
+            context.prec = _decimal_precision([cash, net, rate]) + 20
+            gross = _rounded_money(net * (1 + rate))
+            result.append({
+                "month": format_month(actuals.start_month + index),
+                "clients_cash": format_number(cash),
+                "revenue": format_number(net),
+                "revenue_plus_vat": format_number(gross),
+                "cash_minus_gross": format_number(cash - gross),
+            })
+    return tuple(result)
+
+
 def print_actuals_summary(
     actuals: ActualsReport, stream: TextIO = sys.stdout
 ) -> None:
@@ -1112,51 +1486,200 @@ def _currency_values(
     raise ConfigError("dashboard currency must be 'RON' or 'EUR'")
 
 
-def _render_amount_cell(
-    value: Decimal, source_currency: str, ron_per_eur: Decimal
-) -> str:
-    value_class = " negative" if value < ZERO else ""
+def _money_cell(
+    value: Decimal, source_currency: str, ron_per_eur: Decimal,
+    *, provenance: str = "derived", editable: bool = False,
+    note: str = "", override: str | None = None,
+) -> MoneyCell:
     ron_value, eur_value = _currency_values(value, source_currency, ron_per_eur)
-    ron_text = html.escape(format_number(ron_value), quote=True)
-    eur_text = html.escape(format_number(eur_value), quote=True)
+    return MoneyCell(f"{value:.2f}", format_number(ron_value), format_number(eur_value), provenance, editable, note, override)
+
+
+def _report_row(
+    row_id: str,
+    name: str,
+    values: tuple[Decimal, ...],
+    source_currency: str,
+    ron_per_eur: Decimal,
+) -> ReportRow:
+    return ReportRow(
+        row_id,
+        name,
+        tuple(_money_cell(value, source_currency, ron_per_eur) for value in values),
+    )
+
+
+def _report_group(
+    group_id: str,
+    name: str,
+    rows: list[tuple[str, str, tuple[Decimal, ...]]],
+    source_currency: str,
+    ron_per_eur: Decimal,
+) -> ReportGroup:
+    report_rows = tuple(
+        _report_row(row_id, row_name, values, source_currency, ron_per_eur)
+        for row_id, row_name, values in rows
+    )
+    subtotals = tuple(
+        _sum_money([values[index] for _, _, values in rows]) for index in range(12)
+    )
+    return ReportGroup(
+        group_id,
+        name,
+        report_rows,
+        _report_row(f"subtotal-{group_id}", "Subtotal", subtotals, source_currency, ron_per_eur),
+    )
+
+
+def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> ReportView:
+    """Return the engine-calculated values used by dashboard consumers."""
+    if not ron_per_eur.is_finite() or ron_per_eur <= ZERO:
+        raise ConfigError("ron_per_eur must be a positive finite number")
+
+    if isinstance(report, Projection):
+        source_currency = report.settings.currency
+        months = tuple(format_month(month.month) for month in report.months)
+        groups: list[ReportGroup] = []
+        for activity in ACTIVITY_ORDER:
+            rows = [
+                (row.id, row.name, row.values)
+                for row in report.rows
+                if row.activity == activity
+            ]
+            group = _report_group(activity, activity.title(), rows, source_currency, ron_per_eur)
+            report_rows = tuple(ReportRow(row.id, row.name, tuple(
+                _money_cell(cell.value, source_currency, ron_per_eur,
+                            provenance=cell.provenance, editable=cell.editable,
+                            note=cell.note, override=cell.override)
+                for cell in row.cells
+            )) for row in report.rows if row.activity == activity)
+            groups.append(ReportGroup(group.id, group.name, report_rows, group.subtotal))
+        trough = report.trough
+        first = report.months[0].month
+        last_start = timeline_end(report.settings) - 12
+
+        def balance_row(row_id: str, name: str, attribute: str, note_attribute: str) -> ReportRow:
+            return ReportRow(row_id, name, tuple(
+                _money_cell(getattr(month, attribute), source_currency, ron_per_eur,
+                            provenance=month.provenance, note=getattr(month, note_attribute))
+                for month in report.months
+            ))
+
+        return ReportView(
+            "forecast",
+            source_currency,
+            months,
+            balance_row("opening-balance", "Opening Balance", "opening_balance", "opening_note"),
+            tuple(groups),
+            balance_row("closing-balance", "Closing Balance", "closing_balance", "closing_note"),
+            {
+                "ending_balance": _money_cell(
+                    report.ending_balance, source_currency, ron_per_eur
+                ),
+                "lowest_balance": _money_cell(
+                    trough.closing_balance, source_currency, ron_per_eur
+                ),
+                "lowest_month": format_month(trough.month),
+            },
+            {
+                "start": months[0], "end": months[-1],
+                "previous": format_month(first - 1) if first > report.settings.history_start else None,
+                "next": format_month(first + 1) if first < last_start else None,
+                "min_start": format_month(report.settings.history_start),
+                "max_start": format_month(last_start),
+                "actual_through": format_month(report.actual_through) if report.actual_through >= report.settings.history_start else None,
+            },
+            report.tax_details,
+        )
+
+    source_currency = report.currency
+    groups = tuple(
+        _report_group(
+            section.id,
+            section.name,
+            [
+                (row.id, row.name, row.values.months)
+                for row in section.rows
+            ],
+            source_currency,
+            ron_per_eur,
+        )
+        for section in report.cashflow.sections
+    )
+    closing_values = report.cashflow.closing_balance.months
+    trough_index = min(range(12), key=lambda index: closing_values[index])
+    differences = reconcile_actuals(report)
+    rounding_count = sum(
+        1
+        for difference in differences
+        if abs(difference.difference) <= ACCOUNTING_ROUNDING_TOLERANCE
+    )
+    return ReportView(
+        "actuals",
+        source_currency,
+        tuple(format_month(report.start_month + index) for index in range(12)),
+        _report_row(
+            "opening-balance",
+            "Opening Balance",
+            report.cashflow.opening_balance.months,
+            source_currency,
+            ron_per_eur,
+        ),
+        groups,
+        _report_row(
+            "closing-balance",
+            "Closing Balance",
+            closing_values,
+            source_currency,
+            ron_per_eur,
+        ),
+        {
+            "ending_reported_balance": _money_cell(
+                closing_values[-1], source_currency, ron_per_eur
+            ),
+            "lowest_reported_balance": _money_cell(
+                closing_values[trough_index], source_currency, ron_per_eur
+            ),
+            "lowest_month": format_month(report.start_month + trough_index),
+            "rounding_reconciliation_count": rounding_count,
+            "material_reconciliation_count": len(differences) - rounding_count,
+        },
+    )
+
+
+def _render_amount_cell(
+    cell: MoneyCell, source_currency: str
+) -> str:
+    value_class = " negative" if cell.source.startswith("-") else ""
+    ron_text = html.escape(cell.ron, quote=True)
+    eur_text = html.escape(cell.eur, quote=True)
     visible_text = ron_text if source_currency == "RON" else eur_text
     return (
         f'<td class="amount{value_class}" data-ron="{ron_text}" '
-        f'data-eur="{eur_text}">{visible_text}</td>'
+        f'data-eur="{eur_text}" data-provenance="{html.escape(cell.provenance, quote=True)}" '
+        f'title="{html.escape(cell.note, quote=True)}">{visible_text}</td>'
     )
 
 
 def _render_balance_body(
-    label: str,
-    values: tuple[Decimal, ...],
-    source_currency: str,
-    ron_per_eur: Decimal,
+    row: ReportRow, source_currency: str
 ) -> str:
-    row_class = "opening-row" if label == "Opening Balance" else "closing-row"
+    row_class = "opening-row" if row.id == "opening-balance" else "closing-row"
     return (
         '<tbody class="balance-section">'
-        f'<tr class="balance-row {row_class}"><th scope="row">{html.escape(label)}</th>'
+        f'<tr class="balance-row {row_class}"><th scope="row">{html.escape(row.name)}</th>'
         + "".join(
-            _render_amount_cell(value, source_currency, ron_per_eur)
-            for value in values
+            _render_amount_cell(cell, source_currency) for cell in row.cells
         )
         + "</tr></tbody>"
     )
 
 
 def _render_activity_group(
-    activity_id: str,
-    activity_name: str,
-    category_rows: list[tuple[str, tuple[Decimal, ...]]],
-    source_currency: str,
-    ron_per_eur: Decimal,
+    group: ReportGroup, source_currency: str
 ) -> str:
-    escaped_id = html.escape(activity_id, quote=True)
-    escaped_name = html.escape(activity_name)
-    subtotals = tuple(
-        _sum_money([values[index] for _, values in category_rows])
-        for index in range(12)
-    )
+    escaped_id = html.escape(group.id, quote=True)
+    escaped_name = html.escape(group.name)
     heading = (
         '<tbody class="activity-heading">'
         f'<tr class="activity-heading-row {escaped_id}-heading">'
@@ -1172,110 +1695,38 @@ def _render_activity_group(
         f'<tbody class="activity-children" id="group-{escaped_id}-children">'
         + "".join(
             f'<tr class="subcategory-row {escaped_id}-row">'
-            f'<th scope="row">{html.escape(category_name)}</th>'
+            f'<th scope="row">{html.escape(row.name)}</th>'
             + "".join(
-                _render_amount_cell(value, source_currency, ron_per_eur)
-                for value in values
+                _render_amount_cell(cell, source_currency) for cell in row.cells
             )
             + "</tr>"
-            for category_name, values in category_rows
+            for row in group.rows
         )
         + "</tbody>"
     )
     subtotal = (
         '<tbody class="activity-subtotal">'
         f'<tr class="subtotal-row {escaped_id}-subtotal">'
-        '<th scope="row">Subtotal</th>'
+        f'<th scope="row">{html.escape(group.subtotal.name)}</th>'
         + "".join(
-            _render_amount_cell(value, source_currency, ron_per_eur)
-            for value in subtotals
+            _render_amount_cell(cell, source_currency) for cell in group.subtotal.cells
         )
         + "</tr></tbody>"
     )
     return heading + children + subtotal
 
 
-def _render_projection_rows(
-    projection: Projection, ron_per_eur: Decimal
-) -> str:
-    source_currency = projection.settings.currency
-    sections = [
-        _render_balance_body(
-            "Opening Balance",
-            tuple(month.opening_balance for month in projection.months),
-            source_currency,
-            ron_per_eur,
-        )
-    ]
-    for activity in ACTIVITY_ORDER:
-        category_rows: list[tuple[str, tuple[Decimal, ...]]] = []
-        for category in projection.categories:
-            if category.activity != activity:
-                continue
-            values = tuple(
-                _sum_money(
-                    [
-                        contribution.amount
-                        if contribution.type == "inflow"
-                        else -contribution.amount
-                        for contribution in month.contributions
-                        if contribution.category_id == category.id
-                    ]
-                )
-                for month in projection.months
-            )
-            category_rows.append((category.name, values))
-        sections.append(
-            _render_activity_group(
-                activity,
-                activity.title(),
-                category_rows,
-                source_currency,
-                ron_per_eur,
-            )
-        )
-
-    sections.append(
-        _render_balance_body(
-            "Closing Balance",
-            tuple(month.closing_balance for month in projection.months),
-            source_currency,
-            ron_per_eur,
-        )
+def _render_report_rows(view: ReportView) -> str:
+    return "".join(
+        [
+            _render_balance_body(view.opening_balance, view.currency),
+            *[
+                _render_activity_group(group, view.currency)
+                for group in view.activity_groups
+            ],
+            _render_balance_body(view.closing_balance, view.currency),
+        ]
     )
-    return "".join(sections)
-
-
-def _render_actuals_rows(
-    actuals: ActualsReport, ron_per_eur: Decimal
-) -> str:
-    sections = [
-        _render_balance_body(
-            "Opening Balance",
-            actuals.cashflow.opening_balance.months,
-            actuals.currency,
-            ron_per_eur,
-        )
-    ]
-    for section in actuals.cashflow.sections:
-        sections.append(
-            _render_activity_group(
-                section.id,
-                section.name,
-                [(row.name, row.values.months) for row in section.rows],
-                actuals.currency,
-                ron_per_eur,
-            )
-        )
-    sections.append(
-        _render_balance_body(
-            "Closing Balance",
-            actuals.cashflow.closing_balance.months,
-            actuals.currency,
-            ron_per_eur,
-        )
-    )
-    return "".join(sections)
 
 
 def render_dashboard(
@@ -1290,19 +1741,11 @@ def render_dashboard(
     except OSError as exc:
         raise ConfigError(f"could not read {template_path}: {exc}") from exc
 
-    if not ron_per_eur.is_finite() or ron_per_eur <= ZERO:
-        raise ConfigError("ron_per_eur must be a positive finite number")
-
-    if isinstance(report, ActualsReport):
-        source_currency = report.currency
-        first_month = format_month(report.start_month)
-        last_month = format_month(report.end_month)
-        table_rows = _render_actuals_rows(report, ron_per_eur)
-    else:
-        source_currency = report.settings.currency
-        first_month = format_month(report.months[0].month)
-        last_month = format_month(report.months[-1].month)
-        table_rows = _render_projection_rows(report, ron_per_eur)
+    view = report_view(report, ron_per_eur)
+    source_currency = view.currency
+    first_month = view.months[0]
+    last_month = view.months[-1]
+    table_rows = _render_report_rows(view)
     if source_currency not in {"RON", "EUR"}:
         raise ConfigError("dashboard currency must be 'RON' or 'EUR'")
     values = {
@@ -1312,6 +1755,7 @@ def render_dashboard(
         "ron_pressed": str(source_currency == "RON").lower(),
         "eur_pressed": str(source_currency == "EUR").lower(),
         "table_rows": table_rows,
+        "month_headers": "".join(f'<th scope="col">{month}</th>' for month in view.months),
     }
     return template.substitute(values)
 
@@ -1341,35 +1785,20 @@ def run(
     template_path: Path,
     output_path: Path,
     stream: TextIO = sys.stdout,
-) -> Projection | ActualsReport:
+) -> Projection:
     config = load_config(input_path)
-    if config.settings.dashboard_mode == "actuals":
-        actuals_path = (input_path.parent / config.settings.actuals_file).resolve()
-        actuals = load_actuals(actuals_path)
-        expected_end_month = config.settings.start_month + 11
-        if (
-            actuals.company_name != config.settings.company_name
-            or actuals.registration_number != config.settings.registration_number
-            or actuals.currency != config.settings.currency
-            or actuals.start_month != config.settings.start_month
-            or actuals.end_month != expected_end_month
-        ):
-            raise ConfigError(
-                "settings metadata must match the selected accounting actuals report"
-            )
-        result: Projection | ActualsReport = actuals
-    else:
-        projection = calculate_projection(config)
-        result = projection
+    result = evaluate_config(config, input_path)
 
     dashboard = render_dashboard(result, template_path, config.settings.ron_per_eur)
     write_dashboard(dashboard, output_path)
-    if isinstance(result, ActualsReport):
-        print_actuals_summary(result, stream)
-    else:
-        print_summary(result, stream)
+    print_summary(result, stream)
     print(f"Dashboard written: {output_path}", file=stream)
     return result
+
+
+def evaluate_config(config: Config, input_path: Path | None = None, start: str | None = None) -> Projection:
+    """Evaluate validated configuration without rendering, writing, or printing."""
+    return calculate_projection(config, start)
 
 
 def main() -> int:

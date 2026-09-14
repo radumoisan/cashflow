@@ -1,132 +1,225 @@
 # Declarative Cash Flow
 
-A local cash-flow tool with two deliberately separate data layers:
+A local accounting-plus-forecast table. `cashflow.yaml` is the active source of
+truth; `engine.py` performs all financial calculations. The reviewed model and
+implementation decisions are in [DECISIONS.md](DECISIONS.md).
 
-- `keez-exports/` contains immutable reports received from accounting.
-- `accounting/actuals-2025.yaml` is a normalized, testable transcription of those reports.
-- `cashflow.yaml` contains editable settings, the future category catalog, and scenario assumptions.
-- `engine.py` performs all calculations and writes the standalone `dashboard.html` report.
+The supplied **2025 year is closed accounting history**. No 2026 actuals have
+been provisioned: all of 2026 is initially a forecast, even months before today.
+The starting estimates and accounting interpretation are explained in
+[ACCOUNTING_NOTES.md](ACCOUNTING_NOTES.md).
 
-The current dashboard is in historical `actuals` mode so the implementation can be
-verified against real 2025 figures before forward assumptions are added.
+## Setup and Run
 
-## Requirements
-
-- Python 3.10 or newer
-- PyYAML 6.x
-
-## Setup
+Requires Python 3.10 or newer:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+python server.py
 ```
 
-## Run
+Open <http://127.0.0.1:8000>. The server binds to loopback by default and is
+unauthenticated; use authentication and TLS before exposing it to an untrusted
+network.
+
+## Working with the Table
+
+- The default window is January–December 2026. The compact period control beside
+  RON/EUR moves by a month; click the range to select another starting month.
+  The selected window is retained in the URL, for example `?start=2026-03`.
+- Only direct assumptions in unclosed months are editable, in RON. **Clients
+  and Suppliers inputs exclude VAT.** Positive values add cash; negative values
+  remove cash. EUR is display-only at `settings.ron_per_eur`.
+- **Clients (net) and Suppliers (net) display net values in every month.** Closed
+  gross cash reports use an estimated standard-rate VAT split, assuming full
+  supplier-VAT deductibility. The extracted VAT is included in the VAT row so
+  the cash total still reconciles. Their read-only cell explanations retain the
+  original cash amounts and applied rate.
+- Actuals, VAT, Taxes, dividend payments, subtotals, and balances are read-only.
+- Enter saves and advances; Tab/blur saves; Escape discards unsaved typing.
+  A save already sent to the server can finish after Escape.
+- Empty a cell and save to **remove its override** and restore estimation.
+  Entering `0` instead records an explicit zero.
+- Editable estimates have muted text; overrides have bold accent text. Hover/focus a cell
+  to inspect its provenance and calculation or source explanation.
+- Recurring overrides establish a new run rate from their month onward.
+  Planned one-off movements affect only their specified month.
+- Saves are serialized and confirmed by the server. Invalid or failed edits
+  retain their draft. Currency/period changes wait for pending valid saves.
+- The browser polls every two seconds when idle. An unrelated revision conflict
+  is retried once; a conflicting change to the same cell requires review of
+  the retained draft.
+
+Changing the visible window does not reset cash, VAT credits, losses, or tax
+payments. The same month has the same results in overlapping windows. Windows
+must fit within 100 years from `settings.history_start` and end by 9999-12.
+
+## Active Schema (Version 2)
+
+| Field | Contents |
+| --- | --- |
+| `schema_version` | `2` |
+| `settings` | Company, RON currency, display conversion, default start, 12-month window, dated history start and initial cash |
+| `rows` | Ordered row definitions, activity, forecast method, profit weight, optional explicit net seed, sparse overrides |
+| `actuals` | Contiguous complete accounting months with source, amount basis, all row values, and reported closing balance |
+| `taxes` | Effective-month VAT rates, profit/dividend rates, historical seed interpretation, dated tax-state checkpoints |
+| `tax_payments` | Exact payment amounts by due month, with source and component/total scope |
+| `dividends` | Gross dividend events by payment month, with source |
+
+The stored timeline can exceed twelve months. Generated estimates and derived
+values are not written back into the input file.
+
+A recurring row has this shape:
+
+```yaml
+- id: clients
+  name: Clients (net)
+  activity: operating
+  forecast: carry
+  profit_weight: 1
+  seed: null
+  overrides: {"2026-10": 80000.00}
+```
+
+`carry` uses the latest actual or override. If there is no history, supply an
+explicit net seed as `{value: 80000.00, source: "Business starting assumption"}`.
+`zero` rows default to no planned event. The reserved derived methods are `vat`,
+`taxes`, and `dividends`, attached to their corresponding stable row IDs.
+
+## Supplying Accounting Months
+
+Provide completed-month exports or amounts through files/chat. In the YAML,
+each `actuals[YYYY-MM]` record requires:
+
+- `source`: the accounting reference.
+- `basis: net` for new months: Clients/Suppliers exclude VAT, and the VAT cash
+  row includes VAT collected/paid with operations minus remittances.
+- `values`: **every configured row ID**, including explicit zeros where known.
+- `closing_balance`: the reported cash balance.
+- Optional `opening_balance` and `note` for source reconciliation.
+
+Only complete, contiguous months beginning at `history_start` are accepted.
+Partial information is not published as actuals. `engine.import_actual_month`
+validates a complete update before returning a new document. Corrections to an
+existing month use the same path. Matching overrides become inactive once that
+month is actual; later overrides retain their dates.
+
+Keez Cash Flow contains actual cash receipts/payments, not net revenue/cost
+figures. For exact net normalization, supply aggregate signed Clients VAT and
+Suppliers VAT. `engine.normalize_cash_actual` subtracts those components from
+the gross cash rows and transfers them into VAT, preserving the original cash
+total and reported balances. It records the transformation in the source note.
+The Profit PDF is not a substitute for collections/payment timing.
+
+The 2025 records deliberately retain `basis: reported` and their original cash
+figures. Their source discrepancies appear in balance-cell explanations. The
+user-approved standard-rate conversion supplies both the historical net
+presentation and the initial net forecast run rate. Converted historical Clients,
+Suppliers, and VAT cells carry `actual-net-estimate` provenance and remain locked.
+For each cash row the VAT transferred is gross minus rounded net, preserving
+source cents. Supplied net actuals display directly and supersede these estimates.
+
+`keez-exports/` is immutable evidence. `accounting/actuals-2025.yaml` remains its
+reference transcription. A reset/import from those sources must reconcile the
+corresponding PDFs before replacing active facts.
+
+## VAT, Taxes, and Dividends
+
+VAT uses effective-month rates: initially 19% through July 2025, then 21%.
+Standard-rate VAT and full supplier deductibility are accepted modelling
+assumptions, subject to monthly accounting corrections.
+The engine rounds the Clients and Suppliers VAT components separately, tracks
+credits, and schedules a positive liability for the following month. The VAT
+cash row includes current operating VAT cash and the remittance paid that month.
+
+Profit tax is an explicitly approximate cash-flow model: 16% of positive
+configured profit-proxy contributions after carried losses, paid the following
+month. Losses carry across calendar years. Payroll includes payroll obligations;
+capex, debt principal, advances, VAT, taxes, and shareholder/intercompany cash
+are excluded from the configured proxy. This forecast schedule is distinct from
+the accountant's statutory calculation and payment schedule.
+
+Supply exact tax **payment magnitudes** as positive amounts (or explicit zero):
+
+```yaml
+tax_payments:
+  "2026-10":
+    source: "Accountant-confirmed October payment"
+    profit: 1200.00
+```
+
+Supported components are `profit`, `dividend`, `other`, and `vat`. Alternatively,
+`total` replaces the entire Taxes row for that month, excluding VAT. A `total`
+cannot be combined with profit/dividend/other components; it may accompany `vat`.
+Supplied payments replace estimates rather than adding another cash movement.
+Actual monthly cash rows take precedence over earlier payment estimates.
+
+Gross dividends are separate from other shareholder movements:
+
+```yaml
+dividends:
+  "2026-10": {gross: 10000.00, source: "Planned gross dividend"}
+```
+
+The event generates a shareholder outflow after 16% withholding in that month
+and a withholding payment in the next month. An imported actual dividend payout
+requires a matching gross event or explicit next-month dividend tax/total or
+tax-state checkpoint. An actual zero payout supersedes a cancelled forecast
+event and its forecast withholding.
+
+`taxes.checkpoints[YYYY-MM]` replaces opening VAT credit, profit-proxy loss, and
+outstanding payments as of that month. Its `kind` is `assumption` or `accounting`,
+and `source` explains the values. Payments are positive magnitudes keyed by due
+month and component. The initial January 2026 checkpoint explicitly assumes
+zero carry balances and no prior tax due. Add accounting checkpoints when the
+actual state is supplied; a tax payment alone does not identify a loss balance.
+
+All monetary inputs have at most two decimal places. Decimal calculations use
+ROUND_HALF_UP for VAT components, monthly profit tax, and dividend withholding.
+Net dividend cash is gross less rounded withholding, so the parts reconcile.
+Cash sums retain cents; EUR is rounded only for display.
+
+## API
+
+- `GET /api/health`: service status and API version `2`.
+- `GET /api/state?start=YYYY-MM`: evaluated twelve-month report, cell provenance
+  and editability, tax details, navigation bounds, and YAML `revision`.
+- `PATCH /api/cell?start=YYYY-MM`: set or clear one direct forecast override in
+  that window. Body: `{row_id, month, value, currency}`. `value` is a decimal
+  string or JSON `null` to clear; `currency` must be `RON`.
+
+GET ETags identify the source **and selected window**. A matching
+`If-None-Match` returns `304`. PATCH `If-Match` is the quoted YAML `revision`
+from the response body, **not the GET representation ETag**. Stale writes
+receive `409`; invalid configuration/targets receive `422`.
+
+Each write validates and evaluates the full document, preserving Decimal
+precision, comments, quotes, and file permissions. Atomic replacement prevents
+partial files. The final pre-write revision check detects stale data; an
+uncoordinated external writer can still race in the narrow check-to-replace
+interval.
+
+## Offline Snapshot and Verification
 
 ```bash
 python engine.py
-```
-
-The command validates and reconciles the selected data, prints an engine-generated
-summary, and writes `dashboard.html`. The HTML opens directly from disk and has no
-network dependencies.
-
-```bash
 xdg-open dashboard.html
+python -m unittest discover -s tests -v
+node --check frontend/assets/app.js
 ```
 
-The report is a fixed 13-column matrix: `Activity / Category` followed by `Month 1`
-through `Month 12`. Operating, Investing, and Financing are expanded by default and
-can be collapsed independently; each section keeps its heading and engine-calculated
-subtotal visible while its category rows are hidden. Printing expands every section.
-The RON/EUR control switches between values precomputed by the engine using the fixed
-configured exchange rate. The report uses two decimal places and intentionally has no
-graph, KPI cards, drill-down rows, or final total column.
+`dashboard.html` is a generated, read-only snapshot of the default window. The
+interactive period navigator and persistence are provided by `server.py`.
 
-## Current Configuration
-
-```yaml
-settings:
-  company_name: "PLANEMO SOFTWARE LABS S.R.L."
-  registration_number: "42131419"
-  currency: "RON"
-  ron_per_eur: 5.25
-  start_date: "2025-01"
-  projection_months: 12
-  initial_balance: 1590.00
-  dashboard_mode: "actuals"
-  actuals_file: "accounting/actuals-2025.yaml"
-
-categories:
-  - id: "software"
-    name: "Software"
-    activity: "operating"
-
-recurring: []
-events: []
-```
-
-`dashboard_mode` can be `actuals` or `projection`. Actuals mode renders the normalized
-accounting cash rows. Projection mode renders the category catalog and rolls only the
-recurring and one-off assumptions declared in `cashflow.yaml`. In both modes, section
-subtotals are calculated from the displayed category rows rather than copied from a
-source-reported total.
-
-`ron_per_eur` is the fixed number of RON represented by one EUR. It is used only to
-prepare the alternate dashboard display; source accounting values and projection
-calculations remain in the configured `currency`.
-
-## Accounting References
-
-`accounting/actuals-2025.yaml` preserves both Keez reports:
-
-- Cash flow: reported opening balances, activity sections, category rows, closing balances, and source totals.
-- Profit: revenue and expense categories, EBITDA, amortization, financial costs, taxes, net profit, and source totals.
-
-The engine checks monthly category sums, annual totals, profit formulas, cash closing
-formulas, and opening-balance rollforwards. Keez displays whole RON while aggregating
-more precise source values, so differences up to 6 RON are classified as report
-rounding. Larger differences are reported as material source discrepancies.
-
-The supplied cash report contains two material opening-balance rollforward differences.
-They remain unchanged in the normalized fixture and are detected by the engine.
-
-Profit amounts are never silently treated as cash amounts. The profit report supplies
-the future operating category catalog; cash-only categories come from the cash report.
-`Amortizare` is retained for profit reconciliation but excluded from cash because it is
-non-cash. `Altele` is excluded from the future catalog because it has no activity.
-
-## Projection Entries
-
-Every projection entry references a category ID from the catalog:
-
-```yaml
-recurring:
-  - id: "example-contract"
-    name: "Example Contract"
-    type: "inflow"
-    amount: 5000.00
-    start_date: "2026-01"
-    end_date: null
-    category: "software"
-```
-
-- Dates use `YYYY-MM`; recurring bounds are inclusive.
-- Amounts are positive; `type` determines direction.
-- IDs are unique across recurring and one-off entries.
-- Recurring cancellations preserve the entry by setting `end_date` to the preceding month.
-- A future one-off event cancelled before it occurs may be removed; historical actuals are not modified.
-- Monetary inputs support up to two decimal places and 256 integer digits.
-- The projection window is fixed at twelve months.
-
-## Tests
+For opt-in real Chromium integration checks:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pip install -r requirements-dev.txt
+CASHFLOW_BROWSER_TESTS=1 python -m unittest tests.test_browser -v
 ```
 
-Tests cover Decimal precision, projection boundaries, strict schemas, normalized
-accounting totals, source reconciliation, category mapping, HTML escaping, and the
-13-column grouped report and currency-toggle contracts.
+These tests run against temporary scenario copies and temporary local servers.
+They require Chromium (default `/usr/bin/chromium`, configurable through
+`CHROMIUM_BINARY`) and Selenium's Chrome driver support.
