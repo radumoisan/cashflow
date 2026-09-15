@@ -67,8 +67,12 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(len(state["report"]["months"]), 12)
         cell = state["report"]["opening_balance"]["cells"][0]
         self.assertIsInstance(cell["source"], str)
-        self.assertRegex(cell["ron"], r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
-        self.assertRegex(cell["eur"], r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
+        self.assertRegex(cell["ron"], r"^\d{1,3}(?:,\d{3})*\.\d{2}$")
+        self.assertRegex(cell["eur"], r"^\d{1,3}(?:,\d{3})*\.\d{2}$")
+        negative = state["report"]["activity_groups"][1]["rows"][0]["cells"][0]
+        self.assertTrue(negative["source"].startswith("-"))
+        for currency in ("ron", "eur"):
+            self.assertRegex(negative[currency], r"^\(\d{1,3}(?:,\d{3})*\.\d{2}\)$")
         response = self.client.get("/api/state")
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
@@ -157,6 +161,8 @@ class ServerTests(unittest.TestCase):
             ("unknown", month),
             ("operating", month),
             ("subtotal", month),
+            ("subtotal-inflows", month),
+            ("subtotal-expenses", month),
             ("vat", month),
             ("taxes", month),
             ("dividends-paid", month),
@@ -314,8 +320,8 @@ class ServerTests(unittest.TestCase):
     def test_historical_actuals_show_net_and_reject_patch_in_historical_view(self):
         before = self.config_path.read_bytes()
         state = self.client.get("/api/state?start=2025-01").get_json()
-        operating = state["report"]["activity_groups"][0]
-        rows = {row["id"]: row for row in operating["rows"]}
+        groups = state["report"]["activity_groups"]
+        rows = {row["id"]: row for group in groups for row in group["rows"]}
         self.assertEqual(rows["clients"]["name"], "Clients (net)")
         self.assertEqual(rows["suppliers"]["name"], "Suppliers (net)")
         for id, amount in (("clients", "105649.58"), ("suppliers", "-79570.59"), ("vat", "-2187.99")):
@@ -328,7 +334,11 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(saved.status_code, 422)
         self.assertEqual(rows["clients"]["cells"][0]["eur"], "20,123.73")
         self.assertIn("RON 125,723.00", rows["clients"]["cells"][0]["note"])
-        self.assertEqual(operating["subtotal"]["cells"][0]["source"], "16420.00")
+        vat = next(group for group in groups if group["id"] == "vat")
+        self.assertIsNone(vat["subtotal"])
+        self.assertEqual(sum(Decimal(rows[id]["cells"][0]["source"]) for id in (
+            "clients", "suppliers", "advances", "net-salaries-and-taxes", "vat", "taxes", "miscelaneous",
+        )), Decimal("16420.00"))
         self.assertEqual(state["report"]["closing_balance"]["cells"][0]["source"], "9582.00")
         self.assertEqual(self.config_path.read_bytes(), before)
 

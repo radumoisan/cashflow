@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import html
+import hashlib
+import json
 import os
 import re
 import sys
@@ -11,6 +13,7 @@ import tempfile
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import date as calendar_date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from string import Template
@@ -36,6 +39,7 @@ ROW_ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 MAX_TIMELINE_MONTHS = 1200
 DERIVED_ROWS = {"vat": "vat", "taxes": "taxes", "dividends-paid": "dividends"}
 TAX_COMPONENTS = {"vat", "profit", "dividend", "other"}
+EXPENSE_ROW_IDS = {"suppliers", "net-salaries-and-taxes", "payroll", "fixed-assets", "advances", "miscelaneous", "misc"}
 
 
 class ConfigError(ValueError):
@@ -180,6 +184,21 @@ class Dividend:
 
 
 @dataclass(frozen=True)
+class ExpenseCategory:
+    id: str
+    name: str
+    row_id: str
+    overrides: dict[int, Decimal]
+
+
+@dataclass(frozen=True)
+class ExpenseProject:
+    name: str
+    source: str
+    categories: tuple[ExpenseCategory, ...]
+
+
+@dataclass(frozen=True)
 class Config:
     settings: Settings
     rows: tuple[Row, ...]
@@ -187,6 +206,9 @@ class Config:
     taxes: TaxRules
     tax_payments: dict[int, SuppliedPayment]
     dividends: dict[int, Dividend]
+    expense_projects: dict[str, ExpenseProject] = field(default_factory=dict)
+    movements: dict[str, dict[str, Any]] = field(default_factory=dict)
+    allocation_reviews: dict[int, dict[str, str]] = field(default_factory=dict)
 
     @property
     def actual_through(self) -> int:
@@ -236,6 +258,7 @@ class Projection:
     months: tuple[MonthResult, ...]
     actual_through: int
     tax_details: tuple[dict[str, str], ...]
+    project_groups: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
 
     @property
     def trough(self) -> MonthResult:
@@ -333,7 +356,9 @@ class ReportGroup:
     id: str
     name: str
     rows: tuple[ReportRow, ...]
-    subtotal: ReportRow
+    # None renders the rows as a standalone section, without a heading or total.
+    subtotal: ReportRow | None
+    children: tuple[ReportGroup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -343,6 +368,7 @@ class ReportView:
     mode: str
     currency: str
     months: tuple[str, ...]
+    month_labels: tuple[str, ...]
     opening_balance: ReportRow
     activity_groups: tuple[ReportGroup, ...]
     closing_balance: ReportRow
@@ -366,6 +392,13 @@ def parse_month(value: Any, path: str) -> int:
 def format_month(month_index: int) -> str:
     year, zero_based_month = divmod(month_index, 12)
     return f"{year:04d}-{zero_based_month + 1:02d}"
+
+
+def format_month_label(month_index: int) -> str:
+    """English column label, independent of the host locale or time zone."""
+    year, zero_based_month = divmod(month_index, 12)
+    names = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return f"{names[zero_based_month]} {year % 100:02d}"
 
 
 def _require_mapping(value: Any, path: str) -> dict[str, Any]:
@@ -433,9 +466,12 @@ def _require_decimal(value: Any, path: str) -> Decimal:
 def validate_config(raw: Any) -> Config:
     root = _require_mapping(raw, "cashflow")
     root_keys = {"schema_version", "settings", "rows", "actuals", "taxes", "tax_payments", "dividends"}
+    version = root.get("schema_version")
+    if type(version) is not int or version not in {2, 3}:
+        raise ConfigError("schema_version must be 2 or 3")
+    if version == 3:
+        root_keys |= {"expense_projects", "movements", "allocation_reviews"}
     _check_keys(root, root_keys, root_keys, "cashflow")
-    if type(root["schema_version"]) is not int or root["schema_version"] != 2:
-        raise ConfigError("schema_version must be 2")
     settings_raw = _require_mapping(root["settings"], "settings")
     settings_keys = {
         "company_name", "registration_number", "currency", "ron_per_eur",
@@ -621,10 +657,329 @@ def validate_config(raw: Any) -> Config:
                 f"actual dividend payment in {format_month(month)} requires a matching gross event "
                 "or an explicit following-month tax payment/checkpoint"
             )
-    return Config(settings, tuple(rows), actuals, TaxRules(
+    config = Config(settings, tuple(rows), actuals, TaxRules(
         rates, _require_rate(tax_raw["profit_rate"], "taxes.profit_rate"),
         dividend_rate, seed_basis, checkpoints,
     ), supplied, dividends)
+    if version == 3:
+        _validate_expense_projects(root, config, dated)
+    return config
+
+
+def expense_row_id(project_id: str, category_id: str) -> str:
+    return f"project-{project_id}-{category_id}"
+
+
+def _identifier(value: Any, path: str) -> str:
+    value = _require_text(value, path)
+    if not ROW_ID_PATTERN.fullmatch(value):
+        raise ConfigError(f"{path} must be lowercase hyphenated")
+    return value
+
+
+def _validate_expense_projects(root: dict, config: Config, dated: Any) -> None:
+    used_ids = {row.id for row in config.rows}
+    available = {row.id: row for row in config.rows if row.id in EXPENSE_ROW_IDS
+                 and row.forecast in {"carry", "zero"} and row.activity != "financing"}
+    for project_id, value in _require_mapping(root["expense_projects"], "expense_projects").items():
+        _identifier(project_id, "project id")
+        project = _require_mapping(value, f"expense_projects.{project_id}")
+        _check_keys(project, {"name", "source", "categories"}, {"name", "source", "categories"}, "project")
+        categories = []
+        mapped = set()
+        for value in _require_list(project["categories"], "project.categories"):
+            category = _require_mapping(value, "category")
+            keys = {"id", "name", "row_id", "overrides"}
+            _check_keys(category, keys, keys, "category")
+            category_id = _identifier(category["id"], "category.id")
+            row_id = _require_text(category["row_id"], "category.row_id")
+            if row_id not in available or row_id in mapped:
+                raise ConfigError("each project category must map to a distinct supported direct expense row")
+            mapped.add(row_id)
+            display_id = expense_row_id(project_id, category_id)
+            if display_id in used_ids:
+                raise ConfigError("project row IDs must be unique across the report")
+            used_ids.add(display_id)
+            categories.append(ExpenseCategory(category_id, _require_text(category["name"], "category.name"), row_id, {
+                month: _require_decimal(amount, "project override")
+                for month, amount in dated(category["overrides"], "category.overrides").items()
+            }))
+        if not categories or len({c.id for c in categories}) != len(categories):
+            raise ConfigError("project requires unique categories")
+        config.expense_projects[project_id] = ExpenseProject(
+            _require_text(project["name"], "project.name"), _require_text(project["source"], "project.source"), tuple(categories))
+    source_keys = {"date", "reference", "source", "description", "partner", "row_id", "amount"}
+    assignment_keys = {"project_id", "category_id", "vat", "vat_amount", "source_amount", "allocation_note"}
+    for key, value in _require_mapping(root["movements"], "movements").items():
+        _identifier(key, "movement id")
+        movement = dict(_require_mapping(value, "movement"))
+        _check_keys(movement, source_keys, source_keys | assignment_keys, "movement")
+        date = _require_text(movement["date"], "movement.date")
+        try:
+            if calendar_date.fromisoformat(date).isoformat() != date:
+                raise ValueError
+        except ValueError as exc:
+            raise ConfigError("movement.date must be an ISO calendar date") from exc
+        month = parse_month(date[:7], "movement month")
+        if not config.settings.history_start <= month < timeline_end(config.settings):
+            raise ConfigError("movement outside supported timeline")
+        for field_name in ("reference", "source", "description"):
+            _require_text(movement[field_name], f"movement.{field_name}")
+        if not isinstance(movement["partner"], str):
+            raise ConfigError("movement.partner must be text")
+        if movement["row_id"] is not None and (not isinstance(movement["row_id"], str) or movement["row_id"] not in {r.id for r in config.rows}):
+            raise ConfigError("unknown movement source row")
+        movement["amount"] = _require_decimal(movement["amount"], "movement.amount")
+        owner = movement.get("project_id")
+        if owner is not None:
+            if not isinstance(owner, str) or owner not in config.expense_projects:
+                raise ConfigError("unknown expense project")
+            category = next((c for c in config.expense_projects[owner].categories if c.id == movement.get("category_id")), None)
+            if category is None:
+                raise ConfigError("unknown expense category")
+            if movement["row_id"] is not None and movement["row_id"] != category.row_id:
+                raise ConfigError("project category must match the movement source category")
+            vat = movement.get("vat")
+            if vat not in ("standard", "none", "confirmed"):
+                raise ConfigError("assignment requires standard, none, or confirmed VAT")
+            vat_amount = movement.get("vat_amount")
+            if vat == "confirmed":
+                vat_amount = _require_decimal(vat_amount, "confirmed VAT component")
+                if not _signed_component(vat_amount, movement["amount"]):
+                    raise ConfigError("VAT component must share the cash sign and not exceed cash")
+                movement["vat_amount"] = vat_amount
+            elif vat_amount is not None:
+                raise ConfigError("VAT amount is only valid for confirmed VAT")
+            component = movement.get("source_amount")
+            if component is not None:
+                component = _require_decimal(component, "source-basis amount")
+                if month in config.actuals and config.actuals[month].basis == "reported":
+                    raise ConfigError("exact supplier source-basis amounts require a net accounting month")
+                if category.row_id != "suppliers" or not _signed_component(component, movement["amount"]):
+                    raise ConfigError("source-basis amount must be a signed whole-movement supplier net component")
+                _require_text(movement.get("allocation_note"), "sourced allocation explanation")
+                movement["source_amount"] = component
+            if not isinstance(movement.get("allocation_note", ""), str):
+                raise ConfigError("allocation_note must be text")
+        elif any(movement.get(key) is not None for key in ("category_id", "vat", "vat_amount", "source_amount")):
+            raise ConfigError("unassigned movements cannot retain project allocation fields")
+        config.movements[key] = movement
+    for month, value in dated(root["allocation_reviews"], "allocation_reviews").items():
+        review = dict(_require_mapping(value, "allocation review"))
+        _check_keys(review, {"kind", "source", "digest"}, {"kind", "source", "digest"}, "allocation review")
+        if month not in config.actuals or review["kind"] not in ("assumption", "reviewed"):
+            raise ConfigError("allocation reviews require a closed month and assumption/reviewed kind")
+        _require_text(review["source"], "review.source")
+        if not isinstance(review["digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", review["digest"]):
+            raise ConfigError("review.digest must identify the reviewed source")
+        config.allocation_reviews[month] = review
+        if review["digest"] == _allocation_digest(config, month):
+            if review["kind"] == "assumption":
+                if any(m.get("project_id") for m in _month_movements(config, month).values()):
+                    raise ConfigError("zero allocation assumption cannot include assigned movements")
+            else:
+                _require_reconciled_movements(config, month)
+
+
+def _signed_component(component: Decimal, cash: Decimal) -> bool:
+    return component.copy_abs() <= cash.copy_abs() and (component == ZERO or (component > ZERO) == (cash > ZERO))
+
+
+def _month_movements(config: Config, month: int) -> dict[str, dict]:
+    return {key: m for key, m in config.movements.items() if m["date"][:7] == format_month(month)}
+
+
+def _allocation_digest(config: Config, month: int) -> str:
+    actual = config.actuals[month]
+    source = {"actual": actual.__dict__, "movements": _month_movements(config, month),
+              "mappings": {key: [(c.id, c.row_id) for c in p.categories] for key, p in config.expense_projects.items()},
+              "supplier_basis": config.taxes.reported_cash_seed_basis, "vat_rates": config.taxes.vat_rates}
+    return hashlib.sha256(json.dumps(source, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def allocation_status(config: Config, month: int) -> str:
+    if month not in config.actuals:
+        return "forecast"
+    review = config.allocation_reviews.get(month)
+    return review["kind"] if review and review["digest"] == _allocation_digest(config, month) else "incomplete"
+
+
+def expense_movement_amount(config: Config, movement: dict) -> Decimal:
+    """Whole movement expressed in its company's category basis, not extra cash.
+
+    Suppliers alone use net inputs. Assets, payroll, advances and miscellaneous
+    retain source cash. No allocation changes the authoritative VAT/taxes rows.
+    """
+    category = next(c for c in config.expense_projects[movement["project_id"]].categories if c.id == movement["category_id"])
+    cash = movement["amount"]
+    if category.row_id != "suppliers":
+        return cash
+    month = parse_month(movement["date"][:7], "movement month")
+    actual = config.actuals.get(month)
+    with localcontext() as context:
+        context.prec = MAX_MONEY_INTEGER_DIGITS + 50
+        if actual and actual.basis == "reported":
+            return _rounded_money(cash / (1 + vat_rate_at(config.taxes, month))) if config.taxes.reported_cash_seed_basis == "gross-standard" else cash
+        if movement.get("source_amount") is not None:
+            return movement["source_amount"]
+        if movement["vat"] == "none":
+            return cash
+        if movement["vat"] == "confirmed":
+            return cash - movement["vat_amount"]
+        return _rounded_money(cash / (1 + vat_rate_at(config.taxes, month)))
+
+
+def _require_reconciled_movements(config: Config, month: int) -> None:
+    if month not in config.actuals:
+        raise ConfigError("only complete accounting months can be reviewed")
+    movements = _month_movements(config, month)
+    actual = config.actuals[month]
+    difference = _sum_money([m["amount"] for m in movements.values()] + [v.copy_negate() for v in actual.values.values()])
+    if (not movements and any(actual.values.values())) or difference.copy_abs() > ACCOUNTING_ROUNDING_TOLERANCE:
+        raise ConfigError(f"movement cash must reconcile to the accounting month (difference {format_number(difference)} RON)")
+    # Bound allocations against the authoritative category, allowing source refunds
+    # to offset payments. Comparing absolute net totals alone rejects valid refunds.
+    for row_id in EXPENSE_ROW_IDS & actual.values.keys():
+        assigned = [m for m in movements.values() if m.get("project_id") and
+                    next(c for c in config.expense_projects[m["project_id"]].categories if c.id == m["category_id"]).row_id == row_id]
+        if not assigned:
+            continue
+        values = [expense_movement_amount(config, m) for m in assigned]
+        source = actual.values[row_id]
+        if row_id == "suppliers" and actual.basis == "reported" and config.taxes.reported_cash_seed_basis == "gross-standard":
+            with localcontext() as context:
+                context.prec = MAX_MONEY_INTEGER_DIGITS + 50
+                source = _rounded_money(source / (1 + vat_rate_at(config.taxes, month)))
+        pool = [m["amount"] for m in movements.values() if m["row_id"] == row_id or m in assigned]
+        negative = _sum_money([v for v in values if v < ZERO])
+        positive = _sum_money([v for v in values if v > ZERO])
+        lower = _sum_money([source] + [v.copy_negate() for v in pool if v > ZERO])
+        upper = _sum_money([source] + [v.copy_negate() for v in pool if v < ZERO])
+        if negative < _sum_money([min(lower, ZERO), -ACCOUNTING_ROUNDING_TOLERANCE]) or positive > _sum_money([max(upper, ZERO), ACCOUNTING_ROUNDING_TOLERANCE]):
+            raise ConfigError(f"{row_id} allocations exceed the source category; reconcile classification and source-basis amounts")
+
+
+def initialize_expense_project(raw: Any, project_id: str = "regio", name: str = "Regio") -> dict:
+    """Explicit zero initialization requested by the user, including existing history."""
+    config = validate_config(raw)
+    _identifier(project_id, "project id")
+    updated = deepcopy(raw)
+    updated.update(schema_version=3)
+    projects = updated.setdefault("expense_projects", {})
+    if project_id in projects:
+        raise ConfigError("expense project already exists")
+    definitions = [("suppliers", "Suppliers (net)", "suppliers"), ("payroll", "Payroll", "net-salaries-and-taxes"),
+                   ("fixed-assets", "Fixed Assets", "fixed-assets"), ("advances", "Advances", "advances"),
+                   ("miscellaneous", "Miscellaneous", "miscelaneous")]
+    ids = {r.id for r in config.rows}
+    aliases = {"net-salaries-and-taxes": "payroll", "miscelaneous": "misc"}
+    categories = []
+    for key, label, row_id in definitions:
+        row_id = row_id if row_id in ids else aliases.get(row_id, row_id)
+        if row_id in ids:
+            categories.append(dict(id=key, name=label, row_id=row_id, overrides={}))
+    source = "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    projects[project_id] = dict(name=name, source=source, categories=categories)
+    updated.setdefault("movements", {})
+    updated.setdefault("allocation_reviews", {})
+    candidate = validate_config(updated)
+    for month in config.actuals:
+        if not any(m.get("project_id") for m in _month_movements(candidate, month).values()):
+            updated["allocation_reviews"][format_month(month)] = dict(kind="assumption", source=source, digest=_allocation_digest(candidate, month))
+    validate_config(updated)
+    return updated
+
+
+def parse_source_amount(value: str) -> Decimal:
+    """Parse a Keez Romanian-format monetary scalar without losing cents."""
+    if not isinstance(value, str) or not re.fullmatch(r"[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}", value):
+        raise ConfigError("invalid Keez source amount")
+    return _require_decimal(Decimal(value.replace(".", "").replace(",", ".")), "source amount")
+
+
+def movement_import_summary(movements: dict) -> str:
+    return f"{len(movements)} movements; signed source cash total {format_currency(_sum_money([m['amount'] for m in movements.values()]), 'RON')}"
+
+
+def import_expense_movements(raw: Any, records: dict) -> dict:
+    """Merge complete source batches; overlapping imports preserve assignments."""
+    config = validate_config(raw)
+    if not config.expense_projects:
+        raise ConfigError("initialize an expense project before importing movements")
+    source_keys = {"date", "reference", "source", "description", "partner", "row_id", "amount"}
+    records = _require_mapping(records, "movements")
+    incoming_batches: dict[tuple, set] = {}
+    existing_batches: dict[tuple, set] = {}
+    for key, movement in records.items():
+        _check_keys(_require_mapping(movement, "movement"), source_keys, source_keys, "imported movement")
+        _identifier(key, "movement id")
+        _require_text(movement["date"], "movement.date")
+        _require_text(movement["reference"], "movement.reference")
+        incoming_batches.setdefault((movement["date"][:7], movement["reference"]), set()).add(key)
+    for key, movement in config.movements.items():
+        existing_batches.setdefault((movement["date"][:7], movement["reference"]), set()).add(key)
+    for batch, keys in incoming_batches.items():
+        if batch in existing_batches and keys != existing_batches[batch]:
+            raise ConfigError("previously imported source batch changed or is partial; reconcile its source explicitly")
+    updated = deepcopy(raw)
+    for key, movement in records.items():
+        old = config.movements.get(key)
+        if old:
+            if any(old[field] != movement[field] for field in source_keys - {"source"}):
+                raise ConfigError("movement conflicts with an immutable source record")
+        else:
+            updated["movements"][key] = deepcopy(movement)
+            updated["allocation_reviews"].pop(movement["date"][:7], None)
+    evaluate_config(validate_config(updated))
+    return updated
+
+
+def expense_command(raw: Any, command: dict) -> dict:
+    """Validated whole-movement assignment and explicit month review commands."""
+    config = validate_config(raw)
+    if not config.expense_projects:
+        raise ConfigError("initialize an expense project before assigning or reviewing movements")
+    command = _require_mapping(command, "expense command")
+    action = command.get("action")
+    updated = deepcopy(raw)
+    if action == "assign":
+        keys = {"action", "movement_id", "project_id", "category_id", "vat", "vat_amount", "source_amount", "allocation_note"}
+        _check_keys(command, keys, keys, "assignment")
+        key = _require_text(command["movement_id"], "movement_id")
+        if key not in config.movements:
+            raise ConfigError("unknown accounting movement")
+        movement = updated["movements"][key]
+        before = deepcopy(movement)
+        for field_name in keys - {"action", "movement_id"}:
+            movement.pop(field_name, None)
+        if command["project_id"] is not None:
+            for field_name in keys - {"action", "movement_id"}:
+                value = command[field_name]
+                if field_name in {"vat_amount", "source_amount"} and value is not None:
+                    if isinstance(value, str):
+                        if not re.fullmatch(r"-?\d+(?:\.\d{1,2})?", value):
+                            raise ConfigError(f"{field_name} must be a signed decimal with at most two places")
+                        value = Decimal(value)
+                    value = _require_decimal(value, field_name)
+                movement[field_name] = value
+        if movement != before:
+            updated["allocation_reviews"].pop(movement["date"][:7], None)
+    elif action == "review":
+        keys = {"action", "month", "complete", "source"}
+        _check_keys(command, keys, keys, "month review")
+        month = parse_month(command["month"], "review month")
+        if month not in config.actuals or type(command["complete"]) is not bool:
+            raise ConfigError("review requires a closed month and boolean complete flag")
+        source = _require_text(command["source"], "review source")
+        if command["complete"]:
+            _require_reconciled_movements(config, month)
+            updated["allocation_reviews"][command["month"]] = dict(kind="reviewed", source=source, digest=_allocation_digest(config, month))
+        else:
+            updated["allocation_reviews"].pop(command["month"], None)
+    else:
+        raise ConfigError("unknown expense action")
+    evaluate_config(validate_config(updated))
+    return updated
 
 
 def _nonnegative(value: Any, path: str) -> Decimal:
@@ -672,6 +1027,20 @@ def replace_input(
     """Return a copy with one forecast override set, or cleared with None."""
     config = validate_config(raw)
     target = parse_month(month, "replace_input.month")
+    project_category = next(((key, c) for key, p in config.expense_projects.items() for c in p.categories
+                             if expense_row_id(key, c.id) == row_id), None)
+    if project_category is not None:
+        if not config.actual_through < target < timeline_end(config.settings):
+            raise ConfigError("only forecast months inside the supported timeline are editable")
+        key, category = project_category
+        updated = deepcopy(raw)
+        overrides = next(c for c in updated["expense_projects"][key]["categories"] if c["id"] == category.id)["overrides"]
+        if value is None:
+            overrides.pop(month, None)
+        else:
+            overrides[month] = _require_decimal(value, "replace_input.value")
+        validate_config(updated)
+        return updated
     row = next((row for row in config.rows if row.id == row_id), None)
     if row is None:
         raise ConfigError(f"replace_input references unknown row {row_id!r}")
@@ -693,6 +1062,8 @@ def import_actual_month(raw: Any, month: str, record: dict[str, Any]) -> dict[st
     """Validate a complete accounting update; incomplete imports never become facts."""
     validate_config(raw)
     updated = deepcopy(raw)
+    if updated["actuals"].get(month) != record:
+        updated.get("allocation_reviews", {}).pop(month, None)
     updated["actuals"][month] = deepcopy(record)
     config = validate_config(updated)
     evaluate_config(config)
@@ -933,6 +1304,7 @@ def vat_rate_at(rules: TaxRules, month: int) -> Decimal:
 def _model_end(config: Config, start: int) -> int:
     dates = [config.actual_through, *config.dividends, *config.tax_payments, *config.taxes.checkpoints]
     dates.extend(month for row in config.rows for month in row.overrides)
+    dates.extend(month for project in config.expense_projects.values() for category in project.categories for month in category.overrides)
     dates.extend(month for checkpoint in config.taxes.checkpoints.values() for month in checkpoint.payments)
     return min(timeline_end(config.settings), max(start + 12, max(dates) + 2))
 
@@ -987,6 +1359,10 @@ def calculate_projection(config: Config, start: str | None = None) -> Projection
         carry = {row.id: row.seed for row in config.rows}
         carry_notes = {row.id: f"Starting assumption: {row.seed_source}" for row in config.rows}
         cells: dict[str, list[CellResult]] = {row.id: [] for row in config.rows}
+        row_lookup = {row.id: row for row in config.rows}
+        project_specs = {expense_row_id(key, c.id): (key, c) for key, p in config.expense_projects.items() for c in p.categories}
+        cells.update({key: [] for key in project_specs})
+        mapped_rows = {c.row_id for _, c in project_specs.values()}
         results: list[MonthResult] = []
         details: list[dict[str, str]] = []
         vat_credit = profit_loss = ZERO
@@ -997,6 +1373,20 @@ def calculate_projection(config: Config, start: str | None = None) -> Projection
         for month in range(config.settings.history_start, end):
             date = format_month(month)
             actual = config.actuals.get(month)
+            review_status = allocation_status(config, month) if project_specs else "reviewed"
+            allocated = {key: ZERO for key in project_specs}
+            allocation_sources: dict[str, list[str]] = {key: [] for key in project_specs}
+            if actual:
+                for movement in _month_movements(config, month).values():
+                    if movement.get("project_id"):
+                        key = expense_row_id(movement["project_id"], movement["category_id"])
+                        component = expense_movement_amount(config, movement)
+                        allocated[key] += component
+                        treatment = movement["vat"] + (" (estimate)" if movement["vat"] == "standard" else "")
+                        allocation_sources[key].append(
+                            f"{movement['source']}; {movement['description']}; original cash {format_currency(movement['amount'], 'RON')}; "
+                            f"category-basis allocation {format_currency(component, 'RON')}; VAT treatment {treatment}. {movement.get('allocation_note', '')}")
+            allocated_by_row = {row_id: _sum_money([allocated[key] for key, (_, c) in project_specs.items() if c.row_id == row_id]) for row_id in mapped_rows}
             checkpoint = config.taxes.checkpoints.get(month)
             if checkpoint:
                 vat_credit, profit_loss = checkpoint.vat_credit, checkpoint.profit_loss
@@ -1014,7 +1404,7 @@ def calculate_projection(config: Config, start: str | None = None) -> Projection
                         basis_note += "; historical Shareholders is unsplit; Dividends Paid adds no separate reclassification"
                     month_cells[row.id] = CellResult(value, "actual", note=f"Actual: {actual.source}. {basis_note}. {actual.note}")
                     amounts[row.id] = value
-                    if row.forecast == "carry":
+                    if row.forecast == "carry" and (row.id not in mapped_rows or review_status != "incomplete"):
                         carry[row.id] = value
                         carry_notes[row.id] = f"Carried from actual {date}: {actual.source}"
                         if actual.basis == "reported" and row.id in {"clients", "suppliers"}:
@@ -1023,6 +1413,11 @@ def calculate_projection(config: Config, start: str | None = None) -> Projection
                                 carry_notes[row.id] += "; estimated net conversion of reported cash at the standard VAT rate, not an accounting net figure"
                             else:
                                 carry_notes[row.id] += "; reported amount assumed net by configuration"
+                        if allocated_by_row.get(row.id):
+                            carry[row.id] -= allocated_by_row[row.id]
+                            carry_notes[row.id] += "; reviewed project allocations excluded from regular run rate"
+                    elif row.forecast == "carry":
+                        carry_notes[row.id] += f"; allocation review incomplete for {date}, previous regular run rate retained"
                 elif row.forecast in {"carry", "zero"}:
                     if month in row.overrides:
                         value = row.overrides[month]
@@ -1043,6 +1438,25 @@ def calculate_projection(config: Config, start: str | None = None) -> Projection
                             current.value, current.provenance, current.editable,
                             current.note + "; net of VAT", current.override,
                         )
+
+            for key, (owner, category) in project_specs.items():
+                if actual:
+                    value = allocated[key]
+                    provenance = "allocation-incomplete" if review_status == "incomplete" else "allocation-assumption" if review_status == "assumption" else "actual-allocation"
+                    note = f"{config.expense_projects[owner].name}: {review_status} project allocation; included once in accounting cash. "
+                    note += " | ".join(allocation_sources[key]) or "No movements assigned."
+                    if review_status == "assumption":
+                        note += " " + config.allocation_reviews[month]["source"]
+                    if actual.basis == "reported" and category.row_id == "suppliers" and value:
+                        note += "; historical standard-rate net presentation estimate, not an accounting VAT fact"
+                    month_cells[key] = CellResult(value, provenance, note=note)
+                else:
+                    value = category.overrides.get(month, ZERO)
+                    override = f"{value:.2f}" if month in category.overrides else None
+                    basis = "net of VAT; standard supplier VAT calculated globally" if category.row_id == "suppliers" else "cash basis, including any VAT; no additional VAT generated"
+                    month_cells[key] = CellResult(value, "override" if override is not None else "estimate", True,
+                                                 f"{config.expense_projects[owner].name}: monthly amount only; clear to restore zero. {basis}", override)
+                    amounts[category.row_id] += value
 
             tax_detail = {"month": date, "state_source": state_source}
             if month >= tax_start:
@@ -1126,15 +1540,24 @@ def calculate_projection(config: Config, start: str | None = None) -> Projection
                     month_cells = _net_actual_presentation(
                         month_cells, vat_rate_at(config.taxes, month), config.settings.currency,
                     )
-                for row in config.rows:
-                    cells[row.id].append(month_cells[row.id])
+                if actual:
+                    for row_id, amount in allocated_by_row.items():
+                        current = month_cells[row_id]
+                        if amount or review_status == "incomplete":
+                            month_cells[row_id] = CellResult(current.value - amount, current.provenance, note=current.note +
+                                f"; regular residual after project allocations ({review_status}); authoritative category total preserved")
+                for key in cells:
+                    cells[key].append(month_cells[key])
                 results.append(MonthResult(month, opening, inflows, outflows, net, closing, "actual" if actual else "derived", opening_note, closing_note))
                 details.append(tax_detail)
             balance = closing
 
-    return Projection(config.settings, tuple(
+    regular_rows = tuple(
         ProjectedRow(row.id, row.name, row.activity, tuple(cells[row.id])) for row in config.rows
-    ), tuple(results), config.actual_through, tuple(details))
+    )
+    project_rows = tuple(ProjectedRow(key, c.name, row_lookup[c.row_id].activity, tuple(cells[key])) for key, (_, c) in project_specs.items())
+    project_groups = tuple((key, p.name, tuple(expense_row_id(key, c.id) for c in p.categories)) for key, p in config.expense_projects.items())
+    return Projection(config.settings, regular_rows + project_rows, tuple(results), config.actual_through, tuple(details), project_groups)
 
 
 def _rounded_money(value: Decimal) -> Decimal:
@@ -1148,6 +1571,14 @@ def format_number(value: Decimal, *, signed: bool = False) -> str:
     rounded = _rounded_money(value)
     if signed and rounded > ZERO:
         return f"+{rounded:,.2f}"
+    return f"{rounded:,.2f}"
+
+
+def format_accounting_number(value: Decimal) -> str:
+    """Format table amounts without changing signed source or CLI values."""
+    rounded = _rounded_money(value)
+    if rounded < ZERO:
+        return f"({rounded.copy_abs():,.2f})"
     return f"{rounded:,.2f}"
 
 
@@ -1492,7 +1923,9 @@ def _money_cell(
     note: str = "", override: str | None = None,
 ) -> MoneyCell:
     ron_value, eur_value = _currency_values(value, source_currency, ron_per_eur)
-    return MoneyCell(f"{value:.2f}", format_number(ron_value), format_number(eur_value), provenance, editable, note, override)
+    if provenance == "allocation-incomplete" and value == ZERO:
+        return MoneyCell(f"{value:.2f}", "—", "—", provenance, editable, note, override)
+    return MoneyCell(f"{value:.2f}", format_accounting_number(ron_value), format_accounting_number(eur_value), provenance, editable, note, override)
 
 
 def _report_row(
@@ -1515,6 +1948,8 @@ def _report_group(
     rows: list[tuple[str, str, tuple[Decimal, ...]]],
     source_currency: str,
     ron_per_eur: Decimal,
+    *,
+    subtotal_name: str = "Subtotal",
 ) -> ReportGroup:
     report_rows = tuple(
         _report_row(row_id, row_name, values, source_currency, ron_per_eur)
@@ -1527,8 +1962,65 @@ def _report_group(
         group_id,
         name,
         report_rows,
-        _report_row(f"subtotal-{group_id}", "Subtotal", subtotals, source_currency, ron_per_eur),
+        _report_row(f"subtotal-{group_id}", subtotal_name, subtotals, source_currency, ron_per_eur),
     )
+
+
+def _projection_report_groups(report: Projection, ron_per_eur: Decimal) -> tuple[ReportGroup, ...]:
+    """Group cash spending for display independently of accounting activities."""
+    sections: dict[str, list[ProjectedRow]] = {
+        "inflows": [], "expenses": [], "vat": [], "financing": [],
+    }
+    project_ids = {row_id for _, _, ids in report.project_groups for row_id in ids}
+    for row in report.rows:
+        if row.id in project_ids:
+            continue
+        if row.id == "clients":
+            section = "inflows"
+        elif row.id == "vat":
+            section = "vat"
+        elif row.activity == "financing":
+            section = "financing"
+        else:
+            section = "expenses"
+        sections[section].append(row)
+
+    expense_order = {
+        row_id: index for index, row_id in enumerate((
+            "suppliers", "net-salaries-and-taxes", "taxes", "fixed-assets", "advances", "miscelaneous",
+        ))
+    }
+    sections["expenses"].sort(key=lambda row: expense_order.get(row.id, len(expense_order)))
+    source_currency = report.settings.currency
+    def displayed(row: ProjectedRow) -> ReportRow:
+        return ReportRow(row.id, row.name, tuple(
+            _money_cell(cell.value, source_currency, ron_per_eur, provenance=cell.provenance,
+                        editable=cell.editable, note=cell.note, override=cell.override) for cell in row.cells))
+    project_groups = []
+    for key, name, ids in report.project_groups:
+        rows = [r for r in report.rows if r.id in ids]
+        total = _report_group(f"project-{key}", name, [(r.id, r.name, r.values) for r in rows], source_currency, ron_per_eur, subtotal_name=f"Total {name}").subtotal
+        total = ReportRow(total.id, total.name, tuple(_money_cell(
+            Decimal(cell.source), source_currency, ron_per_eur,
+            provenance="allocation-incomplete" if any(r.cells[i].provenance == "allocation-incomplete" for r in rows) else "derived",
+            note="Known project allocations only; review incomplete" if any(r.cells[i].provenance == "allocation-incomplete" for r in rows) else "Project category total; included once in Total Expenses",
+        ) for i, cell in enumerate(total.cells)))
+        project_groups.append(ReportGroup(f"project-{key}", name, tuple(displayed(r) for r in rows), total))
+    groups = []
+    for group_id, rows in sections.items():
+        name = "VAT" if group_id == "vat" else group_id.title()
+        report_rows = tuple(displayed(row) for row in rows)
+        children = tuple(project_groups) if group_id == "expenses" else ()
+        total_rows = rows + ([r for r in report.rows if r.id in project_ids] if children else [])
+        subtotal = None
+        if group_id != "vat":
+            subtotal = _report_group(
+                group_id, name, [(row.id, row.name, row.values) for row in total_rows],
+                source_currency, ron_per_eur,
+                subtotal_name="Subtotal" if group_id == "financing" else f"Total {name}",
+            ).subtotal
+        groups.append(ReportGroup(group_id, name, report_rows, subtotal, children))
+    return tuple(groups)
 
 
 def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> ReportView:
@@ -1539,21 +2031,7 @@ def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> Rep
     if isinstance(report, Projection):
         source_currency = report.settings.currency
         months = tuple(format_month(month.month) for month in report.months)
-        groups: list[ReportGroup] = []
-        for activity in ACTIVITY_ORDER:
-            rows = [
-                (row.id, row.name, row.values)
-                for row in report.rows
-                if row.activity == activity
-            ]
-            group = _report_group(activity, activity.title(), rows, source_currency, ron_per_eur)
-            report_rows = tuple(ReportRow(row.id, row.name, tuple(
-                _money_cell(cell.value, source_currency, ron_per_eur,
-                            provenance=cell.provenance, editable=cell.editable,
-                            note=cell.note, override=cell.override)
-                for cell in row.cells
-            )) for row in report.rows if row.activity == activity)
-            groups.append(ReportGroup(group.id, group.name, report_rows, group.subtotal))
+        groups = _projection_report_groups(report, ron_per_eur)
         trough = report.trough
         first = report.months[0].month
         last_start = timeline_end(report.settings) - 12
@@ -1569,6 +2047,7 @@ def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> Rep
             "forecast",
             source_currency,
             months,
+            tuple(format_month_label(month.month) for month in report.months),
             balance_row("opening-balance", "Opening Balance", "opening_balance", "opening_note"),
             tuple(groups),
             balance_row("closing-balance", "Closing Balance", "closing_balance", "closing_note"),
@@ -1618,6 +2097,7 @@ def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> Rep
         "actuals",
         source_currency,
         tuple(format_month(report.start_month + index) for index in range(12)),
+        tuple(format_month_label(report.start_month + index) for index in range(12)),
         _report_row(
             "opening-balance",
             "Opening Balance",
@@ -1654,6 +2134,8 @@ def _render_amount_cell(
     ron_text = html.escape(cell.ron, quote=True)
     eur_text = html.escape(cell.eur, quote=True)
     visible_text = ron_text if source_currency == "RON" else eur_text
+    if visible_text.startswith("("):
+        value_class += " accounting-negative"
     return (
         f'<td class="amount{value_class}" data-ron="{ron_text}" '
         f'data-eur="{eur_text}" data-provenance="{html.escape(cell.provenance, quote=True)}" '
@@ -1676,12 +2158,27 @@ def _render_balance_body(
 
 
 def _render_activity_group(
-    group: ReportGroup, source_currency: str
+    group: ReportGroup, source_currency: str, ancestors: tuple[str, ...] = ()
 ) -> str:
     escaped_id = html.escape(group.id, quote=True)
     escaped_name = html.escape(group.name)
+    parents = html.escape(" ".join(ancestors), quote=True)
+    members = html.escape(" ".join((*ancestors, group.id)), quote=True)
+    nested = " project-section" if ancestors else ""
+    if group.subtotal is None:
+        return (
+            '<tbody class="standalone-section">'
+            + "".join(
+                f'<tr class="standalone-row {escaped_id}-row">'
+                f'<th scope="row">{html.escape(row.name)}</th>'
+                + "".join(_render_amount_cell(cell, source_currency) for cell in row.cells)
+                + "</tr>"
+                for row in group.rows
+            )
+            + "</tbody>"
+        )
     heading = (
-        '<tbody class="activity-heading">'
+        f'<tbody class="activity-heading{nested}" data-groups="{parents}">'
         f'<tr class="activity-heading-row {escaped_id}-heading">'
         '<th scope="row">'
         f'<button class="group-toggle" type="button" aria-expanded="true" '
@@ -1692,7 +2189,7 @@ def _render_activity_group(
         + "</tr></tbody>"
     )
     children = (
-        f'<tbody class="activity-children" id="group-{escaped_id}-children">'
+        f'<tbody class="activity-children{nested}" id="group-{escaped_id}-children" data-groups="{members}">'
         + "".join(
             f'<tr class="subcategory-row {escaped_id}-row">'
             f'<th scope="row">{html.escape(row.name)}</th>'
@@ -1705,7 +2202,7 @@ def _render_activity_group(
         + "</tbody>"
     )
     subtotal = (
-        '<tbody class="activity-subtotal">'
+        f'<tbody class="activity-subtotal{nested}" data-groups="{parents}">'
         f'<tr class="subtotal-row {escaped_id}-subtotal">'
         f'<th scope="row">{html.escape(group.subtotal.name)}</th>'
         + "".join(
@@ -1713,11 +2210,12 @@ def _render_activity_group(
         )
         + "</tr></tbody>"
     )
-    return heading + children + subtotal
+    return heading + children + "".join(_render_activity_group(child, source_currency, (*ancestors, group.id)) for child in group.children) + subtotal
 
 
 def _render_report_rows(view: ReportView) -> str:
-    return "".join(
+    gap = '<tbody class="section-gap" aria-hidden="true"><tr><td colspan="13"></td></tr></tbody>'
+    return gap.join(
         [
             _render_balance_body(view.opening_balance, view.currency),
             *[
@@ -1755,7 +2253,7 @@ def render_dashboard(
         "ron_pressed": str(source_currency == "RON").lower(),
         "eur_pressed": str(source_currency == "EUR").lower(),
         "table_rows": table_rows,
-        "month_headers": "".join(f'<th scope="col">{month}</th>' for month in view.months),
+        "month_headers": "".join(f'<th scope="col">{label}</th>' for label in view.month_labels),
     }
     return template.substitute(values)
 

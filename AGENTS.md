@@ -1,6 +1,6 @@
 # Cash Flow Agent Instructions
 
-`cashflow.yaml` is the active version-2 source of truth for accounting actuals,
+`cashflow.yaml` is the active version-3 source of truth for accounting actuals,
 forecast assumptions, tax configuration, and events. `engine.py` is the sole
 authority for financial calculations. Do not edit generated `dashboard.html`.
 
@@ -67,6 +67,35 @@ Keez source interpretation and migration evidence.
 - Accounting reset/import requests must inspect and reconcile corresponding
   PDFs before replacing active values. Preserve reported discrepancies and
   explanations rather than inventing balancing movements or tax/dividend splits.
+
+## Regio Expense Tracking
+
+- See `REGIO.md` and DECISIONS section 16 for the active expense-project model.
+- Actuals and project assignment are a backend file/chat workflow. The user updates
+  exports in `keez-exports/`, asks the assistant to import, and identifies the
+  expenses belonging to Regio. Inspect/reconcile the sources and apply those
+  assignments through the engine. The frontend edits forecasts and displays
+  locked actuals; do not add upload, tagging, or review controls/endpoints.
+- Project forecasts live in `expense_projects.<id>.categories[].overrides`.
+  They apply only to their month and default to zero. Suppliers are net of VAT;
+  Payroll, Fixed Assets, Advances, and Miscellaneous retain the mapped company's
+  cash basis, including any VAT. Taxes remain global.
+- Accounting months still contain only the complete company `rows[]` values.
+  Whole sourced movements are assigned with `engine.expense_command`; derived
+  project allocations subtract from regular rows without changing source totals,
+  VAT, Taxes, or reported balances. Never persist regular residuals as actuals.
+- Use `engine.import_expense_movements` to validate/merge movement imports. Source
+  batches cannot be partially replaced or silently corrected. PDFs remain immutable.
+- Review completion confirms all project movements were identified; signed cash
+  must reconcile to the accounting month. Incomplete reviews retain the prior
+  regular run rate. Reviewed actuals seed regular carry after project subtraction.
+- Existing closed months were explicitly initialized as zero-allocation
+  assumptions at the user's request. New accounting months require review.
+  Source corrections or changed ownership reopen review. Do not hand-edit review
+  digests or use zero assumptions to bypass a pending accounting review.
+- `source_amount` is a documented supplier VAT/source-basis bridge for a whole
+  movement, never a partial ownership allocation. Estimated standard-rate splits
+  retain their provenance; they are not newly supplied accounting facts.
 
 ## Tax and Dividend Inputs
 

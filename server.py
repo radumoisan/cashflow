@@ -24,7 +24,7 @@ from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from engine import ConfigError, evaluate_config, load_config_bytes, replace_input, report_view
 
 
-API_VERSION = 2
+API_VERSION = 3
 MAX_REQUEST_BYTES = 1_048_576
 IF_MATCH_PATTERN = re.compile(r'^"([0-9a-f]{64})"$')
 DECIMAL_PATTERN = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")

@@ -34,7 +34,8 @@
   }
 
   function rows(view) {
-    return [view.opening_balance, ...view.activity_groups.flatMap((group) => [...group.rows, group.subtotal]), view.closing_balance];
+    const flatten = (group) => [...group.rows, ...(group.children || []).flatMap(flatten), ...(group.subtotal ? [group.subtotal] : [])];
+    return [view.opening_balance, ...view.activity_groups.flatMap(flatten), view.closing_balance];
   }
 
   function modelCell(rowId, month) {
@@ -45,11 +46,12 @@
   }
 
   const targetInput = (key) => [...document.querySelectorAll("td.amount input")].find((input) => input.dataset.key === key);
-  const collapsedGroups = () => new Set([...document.querySelectorAll(".activity-children[hidden]")].map((body) => body.id));
+  const collapsedGroups = () => new Set([...document.querySelectorAll('.group-toggle[aria-expanded="false"]')].map((button) => button.getAttribute("aria-controls")));
+  const groupSignature = (group) => [group.id, group.name, Boolean(group.subtotal), (group.children || []).map(groupSignature)];
   const signature = (view) => JSON.stringify({
-    months: view.months, currency: view.currency,
+    months: view.months, monthLabels: view.month_labels, currency: view.currency,
     rows: rows(view).map((row) => [row.id, row.name]),
-    groups: view.activity_groups.map((group) => [group.id, group.name]),
+    groups: view.activity_groups.map(groupSignature),
   });
 
   function cancelDraft(key) {
@@ -82,6 +84,7 @@
     cell.title = description;
     if (state.currency !== "RON" || !value.editable) {
       cell.textContent = state.currency === "EUR" ? value.eur : value.ron;
+      cell.classList.toggle("accounting-negative", cell.textContent.startsWith("("));
       return;
     }
     let input = cell.querySelector("input");
@@ -89,6 +92,7 @@
       input = element("input", { type: "text", inputmode: "decimal", "data-key": key });
       input.addEventListener("focus", () => {
         if (!state.drafts.has(key)) input.value = cell.dataset.source;
+        cell.classList.remove("accounting-negative");
         input.select();
       });
       input.addEventListener("input", () => {
@@ -99,6 +103,7 @@
         state.drafts.set(key, current);
         input.removeAttribute("aria-invalid");
         cell.classList.remove("invalid");
+        cell.classList.remove("accounting-negative");
       });
       input.addEventListener("blur", () => {
         commit(key);
@@ -124,6 +129,7 @@
     if (draft?.error) input.setAttribute("aria-invalid", "true");
     else input.removeAttribute("aria-invalid");
     const text = draft ? draft.value : document.activeElement === input ? value.source : value.ron;
+    cell.classList.toggle("accounting-negative", text.startsWith("("));
     if (input.value !== text) input.value = text;
   }
 
@@ -136,24 +142,43 @@
     return element("tr", { className }, [element("th", { scope: "row", text: data.name }), ...cells]);
   }
 
-  function groupBodies(group, view, collapsed) {
+  function sectionGap(view) {
+    return element("tbody", { className: "section-gap", "aria-hidden": "true" }, [
+      element("tr", {}, [element("td", { colspan: String(view.months.length + 1) })]),
+    ]);
+  }
+
+  function updateGroupVisibility() {
+    const collapsed = collapsedGroups();
+    document.querySelectorAll("tbody[data-groups]").forEach((body) => {
+      body.hidden = body.dataset.groups.split(" ").some((id) => collapsed.has(`group-${id}-children`));
+    });
+  }
+
+  function groupBodies(group, view, collapsed, ancestors = []) {
+    if (!group.subtotal) {
+      return [element("tbody", { className: "standalone-section" }, group.rows.map((row) => tableRow(row, view, `standalone-row ${group.id}-row`)))];
+    }
     const id = `group-${group.id}-children`;
-    const children = element("tbody", { className: "activity-children", id }, group.rows.map((row) => tableRow(row, view, `subcategory-row ${group.id}-row`)));
+    const nested = ancestors.length ? " project-section" : "";
+    const children = element("tbody", { className: `activity-children${nested}`, id, "data-groups": [...ancestors, group.id].join(" ") }, group.rows.map((row) => tableRow(row, view, `subcategory-row ${group.id}-row`)));
     children.hidden = collapsed.has(id);
     const toggle = element("button", { className: "group-toggle", type: "button", "aria-expanded": String(!children.hidden), "aria-controls": id });
     const mark = element("span", { className: "toggle-mark", "aria-hidden": "true", text: children.hidden ? "+" : "-" });
     toggle.append(mark, element("span", { text: group.name }));
     toggle.addEventListener("click", () => {
-      children.hidden = !children.hidden;
-      toggle.setAttribute("aria-expanded", String(!children.hidden));
-      mark.textContent = children.hidden ? "+" : "-";
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      mark.textContent = expanded ? "+" : "-";
+      updateGroupVisibility();
     });
     return [
-      element("tbody", { className: "activity-heading" }, [element("tr", { className: `activity-heading-row ${group.id}-heading` }, [
+      element("tbody", { className: `activity-heading${nested}`, "data-groups": ancestors.join(" ") }, [element("tr", { className: `activity-heading-row ${group.id}-heading` }, [
         element("th", { scope: "row" }, [toggle]), ...view.months.map(() => element("td", { className: "activity-fill", "aria-hidden": "true" })),
       ])]),
       children,
-      element("tbody", { className: "activity-subtotal" }, [tableRow(group.subtotal, view, `subtotal-row ${group.id}-subtotal`)]),
+      ...(group.children || []).flatMap((child) => groupBodies(child, view, collapsed, [...ancestors, group.id])),
+      element("tbody", { className: `activity-subtotal${nested}`, "data-groups": ancestors.join(" ") }, [tableRow(group.subtotal, view, `subtotal-row ${group.id}-subtotal`)]),
     ];
   }
 
@@ -179,7 +204,12 @@
       className: "currency-option", type: "button", "data-currency": currency,
       "aria-pressed": String(state.currency === currency), text: currency, onclick: () => navigate({ currency }),
     })));
-    return element("div", { className: "toolbar" }, [period, toggle]);
+    const controls = [period];
+    if (view.activity_groups.some((group) => group.children?.length)) {
+      controls.push(element("span", { className: "project-hint", text: "Root expenses: regular activity · Regio: monthly amounts, default zero" }));
+    }
+    controls.push(toggle);
+    return element("div", { className: "toolbar" }, controls);
   }
 
   function render(view) {
@@ -188,12 +218,14 @@
     const scroll = { left: previousScroll?.scrollLeft || 0, top: previousScroll?.scrollTop || 0 };
     const table = element("table", { "aria-label": "Twelve-month cash flow" }, [
       element("colgroup", {}, [element("col", { className: "category-column" }), element("col", { span: "12" })]),
-      element("thead", {}, [element("tr", {}, [element("th", { scope: "col", text: "Activity / Category" }), ...view.months.map((month) => element("th", { scope: "col", text: month }))])]),
+      element("thead", {}, [element("tr", {}, [element("th", { scope: "col", text: "Category" }), ...view.month_labels.map((label) => element("th", { scope: "col", text: label }))])]),
       element("tbody", { className: "balance-section" }, [tableRow(view.opening_balance, view, "balance-row opening-row")]),
-      ...view.activity_groups.flatMap((group) => groupBodies(group, view, collapsed)),
+      ...view.activity_groups.flatMap((group) => [sectionGap(view), ...groupBodies(group, view, collapsed)]),
+      sectionGap(view),
       element("tbody", { className: "balance-section" }, [tableRow(view.closing_balance, view, "balance-row closing-row")]),
     ]);
     report.replaceChildren(toolbar(view), element("div", { className: "table-scroll" }, [table]), status);
+    updateGroupVisibility();
     const replacement = document.querySelector(".table-scroll");
     replacement.scrollLeft = scroll.left;
     replacement.scrollTop = scroll.top;

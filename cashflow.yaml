@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 settings:
   company_name: "PLANEMO SOFTWARE LABS S.R.L."
   registration_number: "42131419"
@@ -209,3 +209,86 @@ tax_payments: {}
 
 # Gross positive distributions keyed by event month, each with gross and source.
 dividends: {}
+
+# Regio is global and starts at zero. Monthly overrides never establish a run rate.
+# Suppliers use net amounts; other categories use their regular row's cash basis.
+expense_projects:
+  regio:
+    name: "Regio"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    categories:
+      - id: "suppliers"
+        name: "Suppliers (net)"
+        row_id: "suppliers"
+        overrides: {}
+      - id: "payroll"
+        name: "Payroll"
+        row_id: "net-salaries-and-taxes"
+        overrides: {}
+      - id: "fixed-assets"
+        name: "Fixed Assets"
+        row_id: "fixed-assets"
+        overrides: {}
+      - id: "advances"
+        name: "Advances"
+        row_id: "advances"
+        overrides: {}
+      - id: "miscellaneous"
+        name: "Miscellaneous"
+        row_id: "miscelaneous"
+        overrides: {}
+
+# Immutable source movements plus editable whole-movement ownership/VAT metadata.
+movements: {}
+
+# Explicit initial assumptions, not accounting evidence of no project activity.
+# Digests are engine-generated. Imports/corrections/tags invalidate affected reviews.
+allocation_reviews:
+  "2025-01":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "cf0df8584120261b08294fdc4dd5e06fa583c49860bb51c6b970943b1cfa597f"
+  "2025-02":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "0a4ce5daac3a8d32e636947de226f384262d5c14bc173c0cdf85fc4ccb53ee5f"
+  "2025-03":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "1e7186396b89da361480520476e518c8543a08f7afd6edbf847156872aefdb2a"
+  "2025-04":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "a37a2d5cc97576f1a51a86419bcd5aab0d19c69b12d80e1c3070d145e8cb13f0"
+  "2025-05":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "96c1bfe8e835163ccd6d80b35adbf47dda55fd675bfc669f31512c5fb5242a4f"
+  "2025-06":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "ed51d90019a8ed736bcb979e50eff739d014ec705e0df1a713aa75e167f9e2ed"
+  "2025-07":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "5f39368622fc133e7c21f7df7704255d64953965ba257a6c20d7a4b56e78d576"
+  "2025-08":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "3c808d91fc23c4105286e6235b4d59393c238509232c9eb04486e0bcbed9b0da"
+  "2025-09":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "bac259dc52b4348df6dc2d143a93fc7db6ee9b8a16fd6519375040407ded33e2"
+  "2025-10":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "5d2a7ff3e7df572f082ecf6fef9cb0d0f9b5755007380ecc6c2b514f2ab47ffe"
+  "2025-11":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "c5eae406315b8925139061e9ce4f95b6bb9dc14d42eee23a07242c582ddbc80e"
+  "2025-12":
+    kind: "assumption"
+    source: "User instruction: global project tracking initialized at zero; no project allocation assumed in existing history"
+    digest: "28f847614eef37fb5bab31f1f1febb8e78830193092967d0206531753a8a5ac4"

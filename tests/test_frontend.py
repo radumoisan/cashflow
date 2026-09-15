@@ -10,8 +10,8 @@ CSS = (ROOT / "frontend/assets/styles.css").read_text()
 class FrontendContractTests(unittest.TestCase):
     def test_local_table_shell_and_legacy_geometry(self):
         self.assertIn('<main class="report"', HTML)
-        for text in ("min-width: 1380px", "height: 39px", "col.category-column { width: 300px; }",
-                     "@media (max-width: 720px)", "table { min-width: 1320px; }", "@media print",
+        for text in ("min-width: 1840px", "height: 39px", "col.category-column { width: 300px; }",
+                     "@media (max-width: 720px)", "table { min-width: 1740px; }", "@media print",
                      ".activity-children[hidden] { display: table-row-group; }"):
             self.assertIn(text, CSS)
         for text in ("activity-heading", "activity-children", "activity-subtotal", "balance-section"):

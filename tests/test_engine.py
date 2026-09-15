@@ -9,7 +9,7 @@ from pathlib import Path
 
 from engine import (
     ACCOUNTING_ROUNDING_TOLERANCE, ConfigError, calculate_projection,
-    compare_cash_to_revenue, evaluate_config, format_currency, format_month, import_actual_month,
+    compare_cash_to_revenue, evaluate_config, format_accounting_number, format_currency, format_month, format_number, import_actual_month,
     load_actuals, load_config, load_config_bytes, normalize_cash_actual, parse_month, print_summary,
     reconcile_actuals, render_dashboard, replace_input, report_view, run, validate_config,
 )
@@ -117,6 +117,39 @@ class ForecastTests(unittest.TestCase):
         self.assertEqual(project(raw).ending_balance, Decimal("1" + "0" * 256))
         negative = Decimal("-" + "9" * 100 + ".99")
         self.assertEqual(format_currency(negative, "RON"), "-RON " + f"{negative.copy_abs():,.2f}")
+
+
+class AccountingPresentationTests(unittest.TestCase):
+    def test_accounting_rounding_grouping_and_large_values(self):
+        for value, expected in (
+            ("1234.565", "1,234.57"), ("-1234.565", "(1,234.57)"),
+            ("0", "0.00"), ("-0.00", "0.00"), ("-0.004", "0.00"),
+            ("-0.005", "(0.01)"), ("0.005", "0.01"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(format_accounting_number(Decimal(value)), expected)
+        huge = Decimal("-" + "9" * 100 + ".99")
+        self.assertEqual(format_accounting_number(huge), f"({huge.copy_abs():,.2f})")
+        self.assertEqual(format_number(Decimal("-1234.565")), "-1,234.57")
+        self.assertEqual(format_currency(Decimal("-1234.565"), "RON"), "-RON 1,234.57")
+
+    def test_report_formats_both_currencies_but_preserves_signed_sources_and_cli(self):
+        raw = zero_config()
+        row(raw, "fixed-assets")["overrides"] = {"2026-01": Decimal("-1234.57"), "2026-02": Decimal("-0.01")}
+        projection = project(raw)
+        view = report_view(projection, Decimal("5"))
+        amounts = next(r for r in view.activity_groups[1].rows if r.id == "fixed-assets").cells
+        self.assertEqual([(c.source, c.ron, c.eur) for c in amounts[:3]], [
+            ("-1234.57", "(1,234.57)", "(246.91)"), ("-0.01", "(0.01)", "0.00"), ("0.00", "0.00", "0.00"),
+        ])
+        self.assertTrue(amounts[0].editable)
+        self.assertEqual(amounts[0].override, "-1234.57")
+        rendered = render_dashboard(projection, ROOT / "template.html", Decimal("5"))
+        self.assertIn('class="amount negative accounting-negative" data-ron="(1,234.57)" data-eur="(246.91)"', rendered)
+        output = io.StringIO()
+        print_summary(projection, output)
+        self.assertIn("-1,234.57", output.getvalue())
+        self.assertNotIn("(1,234.57)", output.getvalue())
 
 
 class TaxTests(unittest.TestCase):
@@ -304,8 +337,11 @@ class NetPresentationTests(unittest.TestCase):
         self.assertEqual(raw, original)
         view = report_view(p, Decimal("2"))
         self.assertEqual(view.activity_groups[0].rows[0].cells[0].eur, "50.00")
-        self.assertEqual(view.activity_groups[0].rows[1].cells[0].eur, "-25.00")
-        self.assertEqual(view.activity_groups[0].subtotal.cells[0].source, "56.50")
+        self.assertEqual(view.activity_groups[1].rows[0].cells[0].eur, "(25.00)")
+        self.assertEqual(sum(
+            Decimal((group.subtotal or group.rows[0]).cells[0].source)
+            for group in view.activity_groups
+        ), Decimal("56.50"))
         rendered = render_dashboard(p, ROOT / "template.html", Decimal("2"))
         self.assertIn('data-ron="100.00" data-eur="50.00" data-provenance="actual-net-estimate"', rendered)
         self.assertIn("original reported cash RON 119.00", rendered)
@@ -367,6 +403,52 @@ class NetPresentationTests(unittest.TestCase):
 
 
 class MigrationAndReportTests(unittest.TestCase):
+    def test_cashflow_layout_preserves_every_row_and_reconciles_all_months(self):
+        config = load_config(ROOT / "cashflow.yaml")
+        expected_expenses = [
+            "suppliers", "net-salaries-and-taxes", "taxes", "fixed-assets", "advances", "miscelaneous",
+        ]
+        for start in ("2025-01", "2025-12", "2026-01"):
+            with self.subTest(start=start):
+                projection = calculate_projection(config, start)
+                view = report_view(projection, config.settings.ron_per_eur)
+                inflows, expenses, vat, financing = view.activity_groups
+                self.assertEqual([g.id for g in view.activity_groups], ["inflows", "expenses", "vat", "financing"])
+                self.assertEqual([r.id for r in inflows.rows], ["clients"])
+                self.assertEqual([r.id for r in expenses.rows], expected_expenses)
+                self.assertEqual([r.id for r in vat.rows], ["vat"])
+                self.assertIsNone(vat.subtotal)
+                self.assertEqual([r.id for r in financing.rows], [r.id for r in config.rows if r.activity == "financing"])
+                self.assertEqual([g.subtotal.name for g in (inflows, expenses, financing)], ["Total Inflows", "Total Expenses", "Subtotal"])
+                displayed_rows = [r for g in view.activity_groups for section in (g, *g.children) for r in section.rows]
+                self.assertCountEqual([r.id for r in displayed_rows], [r.id for r in projection.rows])
+                for displayed in displayed_rows:
+                    for cell, original in zip(displayed.cells, cells(projection, displayed.id)):
+                        self.assertEqual(Decimal(cell.source), original.value)
+                        self.assertEqual((cell.provenance, cell.editable, cell.note, cell.override),
+                                         (original.provenance, original.editable, original.note, original.override))
+                for index, month in enumerate(projection.months):
+                    totals = [Decimal(g.subtotal.cells[index].source) for g in (inflows, expenses, financing)]
+                    self.assertEqual(sum(totals) + Decimal(vat.rows[0].cells[index].source), month.net)
+                    self.assertTrue(all(not g.subtotal.cells[index].editable for g in (inflows, expenses, financing)))
+                    self.assertEqual(Decimal(view.closing_balance.cells[index].source), month.closing_balance)
+                    self.assertEqual(Decimal(financing.subtotal.cells[index].source), sum(
+                        r.cells[index].value for r in projection.rows if r.activity == "financing"
+                    ))
+
+    def test_expense_receipts_offset_spending_without_changing_tax_roles(self):
+        raw = zero_config()
+        raw["rows"].append(dict(id="advances", name="Advances", activity="operating", forecast="zero",
+                                profit_weight=0, seed=None, overrides={"2026-01": 40, "2026-02": -40}))
+        row(raw, "fixed-assets")["overrides"] = {"2026-01": -200}
+        row(raw, "misc")["overrides"] = {"2026-01": -10, "2026-02": 10}
+        projection = project(raw)
+        expenses = report_view(projection, Decimal("2")).activity_groups[1]
+        self.assertEqual([cell.source for cell in expenses.subtotal.cells[:2]], ["-170.00", "-30.00"])
+        self.assertEqual([cell.eur for cell in expenses.subtotal.cells[:2]], ["(85.00)", "(15.00)"])
+        self.assertEqual([d["profit_proxy"] for d in projection.tax_details[:2]], ["-10.00", "10.00"])
+        self.assertEqual(next(r.activity for r in projection.rows if r.id == "fixed-assets"), "investing")
+
     def test_every_reported_cash_value_and_balance_matches_reference(self):
         c = load_config(ROOT / "cashflow.yaml")
         reference = load_actuals(ROOT / "accounting/actuals-2025.yaml")
@@ -412,6 +494,8 @@ class MigrationAndReportTests(unittest.TestCase):
         p = project(raw)
         view = report_view(p, Decimal("5.25"))
         self.assertEqual(view.navigation["next"], "2026-02")
+        self.assertEqual(view.months[0], "2026-01")
+        self.assertEqual(view.month_labels[:3], ("Jan 26", "Feb 26", "Mar 26"))
         self.assertIsNone(view.navigation["previous"])
         self.assertTrue(view.activity_groups[0].rows[0].cells[0].editable)
         self.assertFalse(view.opening_balance.cells[0].editable)
@@ -419,8 +503,16 @@ class MigrationAndReportTests(unittest.TestCase):
         self.assertIn("Clients &lt;script&gt;", html)
         self.assertNotIn("Clients <script>", html)
         self.assertEqual(html.count('scope="col"'), 13)
-        self.assertIn('scope="col">2026-01', html)
-        self.assertEqual(html.count('<th scope="row">Subtotal</th>'), 3)
+        self.assertIn('scope="col">Jan 26', html)
+        self.assertIn('scope="col">Dec 26', html)
+        self.assertEqual(html.count('<th scope="row">Total Inflows</th>'), 1)
+        self.assertEqual(html.count('<th scope="row">Total Expenses</th>'), 1)
+        self.assertEqual(html.count('<th scope="row">Subtotal</th>'), 1)
+        self.assertEqual(html.count('<tr class="standalone-row vat-row">'), 1)
+        self.assertNotIn('id="group-vat-children"', html)
+        self.assertNotIn('id="group-investing-children"', html)
+        self.assertLess(html.index('expenses-subtotal'), html.index('<tr class="standalone-row vat-row">'))
+        self.assertLess(html.index('<tr class="standalone-row vat-row">'), html.index('financing-heading'))
 
     def test_run_and_summary_use_engine_results(self):
         with tempfile.TemporaryDirectory() as temp:

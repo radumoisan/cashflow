@@ -70,12 +70,12 @@
       width: 100%;
       max-height: calc(100vh - 48px);
       overflow: auto;
-      border: 1px solid var(--line);
+      border-block: 1px solid var(--line);
     }
 
     table {
       width: 100%;
-      min-width: 1380px;
+      min-width: 1840px;
       border-collapse: collapse;
       table-layout: fixed;
     }
@@ -96,8 +96,8 @@
     table > tbody:last-of-type > tr:last-child th,
     table > tbody:last-of-type > tr:last-child td { border-bottom: 0; }
 
-    th:last-child,
-    td:last-child { border-right: 0; }
+    thead th:first-child,
+    tbody th { border-left: 1px solid var(--line); }
 
     thead th {
       position: sticky;
@@ -130,18 +130,48 @@
       text-align: right;
     }
 
+    td.amount {
+      --amount-inset: 8px;
+      font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", ui-monospace, "DejaVu Sans Mono", monospace;
+      /* Reserve the closing parenthesis even on positive amounts. */
+      padding-right: calc(var(--amount-inset) + 1ch);
+    }
+
+    td.amount.accounting-negative { padding-right: var(--amount-inset); }
+
+    .section-gap td {
+      height: 6px;
+      padding: 0;
+      border: 0;
+      background: #fff;
+    }
+
+    .inflows-heading, .inflows-subtotal {
+      --section-ink: #176447;
+      --section-heading: #e8f4ee;
+      --section-total: #f0f8f3;
+      --section-line: #bcd9c9;
+    }
+
+    .expenses-heading, .expenses-subtotal {
+      --section-ink: #805313;
+      --section-heading: #fbf0dc;
+      --section-total: #fdf7ec;
+      --section-line: #e5cfaa;
+    }
+
     .activity-heading-row {
-      color: var(--accent);
-      background: #eae8f3;
-      border-top: 2px solid #c7c3db;
+      color: var(--section-ink, var(--accent));
+      background: var(--section-heading, #eae8f3);
+      border-top: 2px solid var(--section-line, #c7c3db);
     }
 
     .activity-heading-row th {
-      background: #eae8f3;
+      background: var(--section-heading, #eae8f3);
       padding: 0;
     }
 
-    .activity-fill { background: #eae8f3; }
+    .activity-fill { background: var(--section-heading, #eae8f3); }
 
     .group-toggle {
       display: flex;
@@ -151,7 +181,7 @@
       gap: 9px;
       padding: 0 8px;
       border: 0;
-      color: var(--accent);
+      color: var(--section-ink, var(--accent));
       background: transparent;
       font: inherit;
       font-weight: 700;
@@ -169,7 +199,7 @@
       width: 18px;
       height: 18px;
       place-items: center;
-      border: 1px solid #aaa5c5;
+      border: 1px solid var(--section-line, #aaa5c5);
       border-radius: 2px;
       font-size: 14px;
       line-height: 1;
@@ -190,17 +220,30 @@
     }
 
     .subtotal-row {
-      color: var(--accent);
-      background: #f0eef7;
+      color: var(--section-ink, var(--accent));
+      background: var(--section-total, #f0eef7);
       font-weight: 700;
-      border-bottom: 2px solid #c7c3db;
+      border-bottom: 2px solid var(--section-line, #c7c3db);
     }
 
     .subtotal-row th {
-      color: #3d3d43;
-      background: #f0eef7;
+      color: var(--section-ink, #3d3d43);
+      background: var(--section-total, #f0eef7);
       font-weight: 700;
       text-align: right;
+    }
+
+    .inflows-subtotal, .expenses-subtotal, .vat-row { font-size: 14px; }
+
+    .vat-row, .vat-row th {
+      color: #245980;
+      background: #eaf2fa;
+      font-weight: 700;
+    }
+
+    .vat-row {
+      border-top: 2px solid #bfd3e6;
+      border-bottom: 2px solid #bfd3e6;
     }
 
     .balance-row {
@@ -215,14 +258,28 @@
     }
 
     .negative { color: #3d3d43; }
+    .closing-row { border-top: 1px solid var(--line); font-size: 16px; }
+    .closing-row th, .closing-row td { height: 44px; }
+    .closing-row td { padding-left: 2px; }
     .closing-row .negative { color: #b42318; }
+
+    .project-section {
+      --section-ink: #805313;
+      --section-heading: #fdf7ec;
+      --section-total: #fffbf3;
+      --section-line: #e5cfaa;
+    }
+    .project-section .group-toggle { padding-left: 35px; }
+    .project-section .subcategory-row th { padding-left: 62px; }
+    tbody[data-groups][hidden] { display: none; }
+    td[data-provenance="allocation-incomplete"] { color: #805313; text-decoration: underline dotted; }
 
     @media (max-width: 720px) {
       body { font-size: 13px; }
       .report { width: calc(100% - 24px); padding-top: 12px; }
       .toolbar { margin-bottom: 8px; }
-      table { min-width: 1320px; }
-      col.category-column { width: 280px; }
+      table { min-width: 1740px; }
+      col.category-column { width: 200px; }
       th, td { padding: 8px; }
     }
 
@@ -232,10 +289,17 @@
       .toolbar { display: none; }
       .table-scroll { max-height: none; overflow: visible; }
       table { min-width: 0; font-size: 8px; }
+      .inflows-subtotal, .expenses-subtotal, .vat-row { font-size: 8px; }
       col.category-column { width: 165px; }
       th, td { height: 25px; padding: 4px; }
+      td.amount { --amount-inset: 4px; }
+      .closing-row { font-size: 9.5px; }
+      .closing-row th, .closing-row td { height: 28px; }
+      .closing-row td.amount { --amount-inset: 1px; padding-left: 1px; }
+      .section-gap td { height: 4px; }
       thead th, tbody th { position: static; }
       .activity-children[hidden] { display: table-row-group; }
+      tbody[data-groups][hidden] { display: table-row-group; }
       .toggle-mark { display: none; }
     }
   </style>
@@ -256,7 +320,7 @@
         </colgroup>
         <thead>
           <tr>
-            <th scope="col">Activity / Category</th>
+            <th scope="col">Category</th>
             ${month_headers}
           </tr>
         </thead>
@@ -277,6 +341,7 @@
           report.dataset.displayCurrency = currency;
           amountCells.forEach((cell) => {
             cell.textContent = cell.dataset[valueKey];
+            cell.classList.toggle("accounting-negative", cell.textContent.startsWith("("));
           });
           currencyButtons.forEach((option) => {
             option.setAttribute(
@@ -289,11 +354,13 @@
 
       document.querySelectorAll(".group-toggle").forEach((button) => {
         button.addEventListener("click", () => {
-          const children = document.getElementById(button.getAttribute("aria-controls"));
           const expanded = button.getAttribute("aria-expanded") === "true";
-          children.hidden = expanded;
           button.setAttribute("aria-expanded", String(!expanded));
           button.querySelector(".toggle-mark").textContent = expanded ? "+" : "-";
+          const collapsed = new Set([...document.querySelectorAll('.group-toggle[aria-expanded="false"]')].map((toggle) => toggle.getAttribute("aria-controls")));
+          document.querySelectorAll("tbody[data-groups]").forEach((body) => {
+            body.hidden = body.dataset.groups.split(" ").some((id) => collapsed.has("group-" + id + "-children"));
+          });
         });
       });
     })();

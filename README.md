@@ -26,9 +26,21 @@ network.
 
 ## Working with the Table
 
+- The table shows **Inflows** (Clients), **Expenses** (Suppliers, Payroll, Taxes,
+  Fixed Assets, Advances, and Miscellaneous), a standalone **VAT** row, and
+  **Financing** with its existing rows and subtotal. Each collapsible section
+  keeps its total visible; VAT is always visible. Positive receipts within
+  Expenses offset spending in its signed total.
+- **Regio** is nested under Expenses, with its own collapse control and total.
+  Root expense rows represent regular activity; project amounts appear only in
+  Regio. Forecast category cells default to zero and apply only to their month.
+  For actuals, update the exports in `keez-exports/` and tell the assistant to
+  import them, identifying the expenses belonging to Regio. See [REGIO.md](REGIO.md).
 - The default window is January–December 2026. The compact period control beside
   RON/EUR moves by a month; click the range to select another starting month.
   The selected window is retained in the URL, for example `?start=2026-03`.
+  Column headers use abbreviated English months and two-digit years: `Jan 26`,
+  `Feb 26`, `Mar 26`.
 - Only direct assumptions in unclosed months are editable, in RON. **Clients
   and Suppliers inputs exclude VAT.** Positive values add cash; negative values
   remove cash. EUR is display-only at `settings.ron_per_eur`.
@@ -56,17 +68,20 @@ Changing the visible window does not reset cash, VAT credits, losses, or tax
 payments. The same month has the same results in overlapping windows. Windows
 must fit within 100 years from `settings.history_start` and end by 9999-12.
 
-## Active Schema (Version 2)
+## Active Schema (Version 3)
 
 | Field | Contents |
 | --- | --- |
-| `schema_version` | `2` |
+| `schema_version` | `3` (version-2 scenarios remain supported) |
 | `settings` | Company, RON currency, display conversion, default start, 12-month window, dated history start and initial cash |
 | `rows` | Ordered row definitions, activity, forecast method, profit weight, optional explicit net seed, sparse overrides |
 | `actuals` | Contiguous complete accounting months with source, amount basis, all row values, and reported closing balance |
 | `taxes` | Effective-month VAT rates, profit/dividend rates, historical seed interpretation, dated tax-state checkpoints |
 | `tax_payments` | Exact payment amounts by due month, with source and component/total scope |
 | `dividends` | Gross dividend events by payment month, with source |
+| `expense_projects` | Named expense projects with category-to-company-row mappings and sparse monthly overrides |
+| `movements` | Immutable accounting movement facts plus editable whole-movement project ownership and VAT-basis metadata |
+| `allocation_reviews` | Sourced zero assumptions or completed monthly allocation reviews, fingerprinted against their source |
 
 The stored timeline can exceed twelve months. Generated estimates and derived
 values are not written back into the input file.
@@ -83,7 +98,9 @@ A recurring row has this shape:
   overrides: {"2026-10": 80000.00}
 ```
 
-`carry` uses the latest actual or override. If there is no history, supply an
+`carry` uses the latest usable actual or override. Project-mapped expense rows
+use reviewed actuals less project allocations; while review is incomplete, the
+previous regular run rate is retained. If there is no history, supply an
 explicit net seed as `{value: 80000.00, source: "Business starting assumption"}`.
 `zero` rows default to no planned event. The reserved derived methods are `vat`,
 `taxes`, and `dividends`, attached to their corresponding stable row IDs.
@@ -97,6 +114,8 @@ each `actuals[YYYY-MM]` record requires:
 - `basis: net` for new months: Clients/Suppliers exclude VAT, and the VAT cash
   row includes VAT collected/paid with operations minus remittances.
 - `values`: **every configured row ID**, including explicit zeros where known.
+  These are company `rows[]` IDs; project rows are allocated from them, never
+  separately supplied as additional accounting cash.
 - `closing_balance`: the reported cash balance.
 - Optional `opening_balance` and `note` for source reconciliation.
 
@@ -183,12 +202,23 @@ Cash sums retain cents; EUR is rounded only for display.
 
 ## API
 
-- `GET /api/health`: service status and API version `2`.
+- `GET /api/health`: service status and API version `3`.
 - `GET /api/state?start=YYYY-MM`: evaluated twelve-month report, cell provenance
   and editability, tax details, navigation bounds, and YAML `revision`.
+  `report.months` retains `YYYY-MM` keys; `report.month_labels` supplies the
+  corresponding column labels such as `Jan 26` for both live and snapshot views.
+  `report.activity_groups` contains the ordered display sections: `inflows`,
+  `expenses`, `vat`, and `financing`. A `null` subtotal identifies a standalone
+  section (VAT) rendered without a collapsible heading or duplicate total.
+  Groups have a `children` array; Expenses contains Regio there. Group totals
+  already include descendants. Sum leaf rows once, not both leaves and totals.
 - `PATCH /api/cell?start=YYYY-MM`: set or clear one direct forecast override in
   that window. Body: `{row_id, month, value, currency}`. `value` is a decimal
   string or JSON `null` to clear; `currency` must be `RON`.
+  Project row IDs, such as `project-regio-suppliers`, use this same endpoint.
+
+Accounting imports and Regio assignments use the backend engine through files/chat.
+The HTTP interface provides forecast editing and read-only actuals display.
 
 GET ETags identify the source **and selected window**. A matching
 `If-None-Match` returns `304`. PATCH `If-Match` is the quoted YAML `revision`

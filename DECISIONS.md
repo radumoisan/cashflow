@@ -2,10 +2,11 @@
 
 Date: 2026-09-13
 
-Status: **Implemented and verified (schema version 2)**
+Status: **Implemented: schema version 3, including Regio expense tracking**
 
 This document records the reviewed product and financial-model decisions agreed
-with the user. It is the specification for the version-2 forecasting model.
+with the user. Sections 1–15 specify the underlying version-2 forecasting model;
+section 16 adds the version-3 expense-project extension.
 Section 11 records the implementation-phase resolutions. Operational usage is
 documented in `README.md` and `AGENTS.md`; source interpretation is documented in
 [ACCOUNTING_NOTES.md](ACCOUNTING_NOTES.md).
@@ -401,3 +402,111 @@ passed, and the engine regenerated the scenario snapshot. Regression coverage
 includes all twelve source-month cash totals, historical rate changes, signed
 cent residuals, accountant-supplied net corrections, mixed windows, and RON/EUR
 presentation.
+
+## 15. Inflows and expenses layout
+
+The user approved the following presentation order on 2026-09-15:
+
+1. Opening Balance.
+2. **Inflows:** Clients (net), followed by Total Inflows.
+3. **Expenses:** Suppliers (net), Payroll, Taxes, Fixed Assets, Advances, and
+   Miscellaneous, followed by Total Expenses.
+4. **VAT:** a standalone, read-only monthly row, outside Expenses.
+5. **Financing:** the existing rows, order, and subtotal, including Interest and
+   Bank Charges, Other Shareholder Movements, and Dividends Paid.
+6. Closing Balance.
+
+Inflows and Expenses use subtle green and amber section accents; VAT has its own
+blue band. Collapsing a section leaves its total visible. VAT has no collapsible
+heading or duplicate subtotal. The active report uses this layout for historical,
+forecast, and mixed windows in both the browser and generated snapshot.
+
+Major sections are separated by 6 px full-width gaps, including between Opening
+Balance and Inflows. Regio stays nested without an additional gap. The decorative
+spacers are hidden from assistive technology and reduce to 4 px when printing.
+Side borders stop at each gap, and Closing Balance has a thin top divider to
+make its separation from Financing visible.
+
+These are presentation groups, independent of the stored accounting activities
+and profit-proxy weights. Expenses is a signed cash-spending total: positive
+Advances or Miscellaneous receipts offset negative spending. Grouping a Fixed
+Assets or Advances row under Expenses does not make it a profit-tax contributor.
+All group totals are computed in the engine; original row IDs, amounts, cell
+provenance, and editability remain attached to their rows.
+
+Column headers use abbreviated English month names with two-digit years
+(`Jan 26`, `Feb 26`, `Mar 26`), as subsequently requested by the user. The engine
+supplies the same labels to the live table and snapshot. Stored month keys,
+cell identities, and the period selector retain `YYYY-MM` dates.
+
+Amounts use a local JetBrains Mono font stack with monospace fallbacks; labels
+retain the sans-serif face. Both live and snapshot RON/EUR amounts use accounting
+parentheses for negatives, e.g. `(1,234.56)`. Positive amounts reserve the closing
+parenthesis space for decimal alignment. Rounded zero remains `0.00`; unknown
+allocations remain an em dash. Focused editors and unsaved drafts use signed,
+ungrouped values, and saved cells return to accounting notation on blur.
+Source values, YAML, calculations, CLI output, and provenance notes remain signed.
+Closing Balance retains its larger 16 px text and red negative values. Wider
+month columns accommodate the amounts, with horizontal scrolling on smaller
+screens and compact padding for landscape printing.
+
+## 16. Regio expense forecasts and actual ownership
+
+Approved on 2026-09-15, with the interaction scope clarified by the user:
+
+- Regio is a global nested group under Expenses. Initialize every forecast month
+  at zero and preserve current financial results. Existing closed months use
+  sourced zero-allocation assumptions, not newly asserted accounting facts.
+- Forecast by **monthly category totals**: Suppliers, Payroll, Fixed Assets,
+  Advances, Miscellaneous. Clear restores zero; an override never carries.
+- Keep Taxes company-wide. Each project category inherits its existing company
+  row's financial mapping and input basis: Suppliers net with global standard
+  VAT; all other categories use cash including any VAT, without generating an
+  additional VAT component. Capex and Advances retain zero profit weights.
+- The engine combines regular plus project inputs once for forecast financial
+  calculations, displaying the regular and project components separately.
+- The user updates source files in `keez-exports/`, notifies the assistant to
+  import, and flags the expenses belonging to Regio. The assistant reconciles and
+  imports complete company actuals and detailed movements through the backend,
+  assigning **whole movements** according to the user's instructions. No partial
+  transaction ownership. Project and regular category values always sum to the
+  authoritative category, preserving original accounting cash, VAT, Taxes, and
+  reported balances. A closed month's actuals supersede its forecast.
+- Supplier assignment supports standard-rate estimates, no VAT, or a confirmed
+  signed VAT component. A sourced accounting-basis bridge handles documented VAT
+  recognition differences. Reported history retains estimated net presentation;
+  these estimates never establish tax state or rewrite original source amounts.
+- Open-month tags are provisional; they do not add cash on top of a forecast.
+  Closed-month tagging displays known allocations with incomplete provenance
+  until the backend records completed review based on the user's identification
+  of project expenses. Unknown zero-allocation cells show
+  an em dash; explicit initial zero assumptions remain distinguishable.
+- Completed review requires movement cash reconciliation and valid category
+  allocations, including refund offsets. A no-cash month may be explicitly
+  reviewed without inventing transactions. Review covers every project.
+- Regular carry-forward uses actual category less reviewed project allocation.
+  Until review is complete, retain the last usable regular run rate. Corrections,
+  changed assignments, or changed source/mapping fingerprints invalidate review.
+- Source imports and assignments use engine validation before publishing the
+  updated YAML. Complete duplicate imports preserve assignments;
+  changed/partial previously imported batches require explicit reconciliation.
+- Browser interaction is limited to forecast editing and read-only actuals
+  display. The frontend upload/tagging/review workflow was an implementation
+  overreach and has been removed, including its dedicated HTTP endpoints.
+- Regio and Expenses collapse independently, retain their own totals, and share
+  the live/snapshot engine report. All financial arithmetic remains in the engine.
+
+The active schema uses `expense_projects`, `movements`, and `allocation_reviews`;
+version-2 scenarios remain readable. The earlier unintegrated `PROJECTS.md` and
+project UI/test drafts describe a broader design; `REGIO.md` documents this
+implemented workflow.
+
+Zero initialization was compared against the prior scenario across historical,
+mixed, and forecast windows: existing rows, taxes, and balances match exactly.
+
+Verified after the file/chat workflow correction on 2026-09-15: 84 standard tests
+and all 11 Chromium tests passed. Coverage includes backend movement import and
+assignment, locked actuals refreshing in the browser, forecast editing, and
+the absence of actuals import/assignment HTTP endpoints. Full discovery still
+reports the two pre-existing import errors in the unintegrated
+`tests/test_projects.py` and `tests/test_project_api.py` drafts.
