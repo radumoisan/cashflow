@@ -1,4 +1,39 @@
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
+import io
+
+
+@lru_cache(maxsize=1)
+def legacy_forecast_bytes():
+    """Isolate the initial 2026 forecast for editing and 2025 migration tests.
+
+    New accounting imports and scenario overrides must not close the test editors.
+    This only prepares test data; the active scenario is never written.
+    """
+    from server import _round_trip_yaml
+    path = Path(__file__).resolve().parents[1] / "cashflow.yaml"
+    yaml, raw = _round_trip_yaml(path.read_bytes(), path)
+    raw["settings"]["start_date"] = "2026-01"
+    raw["actuals"] = {month: record for month, record in raw["actuals"].items() if month <= "2025-12"}
+    raw["allocation_reviews"] = {month: review for month, review in raw["allocation_reviews"].items() if month <= "2025-12"}
+    raw["movements"] = {}
+    raw["tax_payments"] = {}
+    raw["dividends"] = {}
+    raw["taxes"]["checkpoints"] = base_config()["taxes"]["checkpoints"]
+    for row in raw["rows"]:
+        row["overrides"] = {}
+    for project in raw["expense_projects"].values():
+        for category in project["categories"]:
+            category["overrides"] = {}
+    output = io.StringIO()
+    yaml.dump(raw, output)
+    return output.getvalue().encode("utf-8")
+
+
+def legacy_forecast_config():
+    from server import _round_trip_yaml
+    return _round_trip_yaml(legacy_forecast_bytes(), Path("legacy-forecast-fixture.yaml"))[1]
 
 
 def base_config(start="2026-01"):

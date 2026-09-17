@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from decimal import Decimal
+from html.parser import HTMLParser
 from pathlib import Path
 
 from engine import (
@@ -13,7 +14,7 @@ from engine import (
     load_actuals, load_config, load_config_bytes, normalize_cash_actual, parse_month, print_summary,
     reconcile_actuals, render_dashboard, replace_input, report_view, run, validate_config,
 )
-from tests.fixtures import actual_record, base_config, row, zero_config
+from tests.fixtures import actual_record, base_config, legacy_forecast_config, row, zero_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -344,7 +345,7 @@ class NetPresentationTests(unittest.TestCase):
         ), Decimal("56.50"))
         rendered = render_dashboard(p, ROOT / "template.html", Decimal("2"))
         self.assertIn('data-ron="100.00" data-eur="50.00" data-provenance="actual-net-estimate"', rendered)
-        self.assertIn("original reported cash RON 119.00", rendered)
+        self.assertNotIn("original reported cash RON 119.00", rendered)
 
     def test_cent_residuals_zero_and_refunds_preserve_the_source_cash(self):
         for clients, suppliers, vat, net_clients, net_suppliers in (
@@ -388,7 +389,7 @@ class NetPresentationTests(unittest.TestCase):
         self.assertIn("assumed net by configuration", cells(p, "clients")[0].note)
 
     def test_mixed_windows_agree_and_do_not_double_convert_forecasts_or_overrides(self):
-        c = load_config(ROOT / "cashflow.yaml")
+        c = validate_config(legacy_forecast_config())
         first, shifted = calculate_projection(c, "2025-07"), calculate_projection(c, "2025-12")
         for original, other in zip(first.rows, shifted.rows):
             self.assertEqual(original.cells[5:], other.cells[:7])
@@ -400,6 +401,60 @@ class NetPresentationTests(unittest.TestCase):
         raw = self.reported_config()
         row(raw, "clients")["overrides"]["2025-09"] = 250
         self.assertEqual([cell.value for cell in cells(project(raw), "clients")[2:4]], [250, 250])
+
+
+class PeriodPresentationTests(unittest.TestCase):
+    def assert_snapshot_periods(self, projection, expected):
+        class Cells(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.amounts, self.headers = [], []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "td" and "amount" in attrs.get("class", "").split():
+                    self.amounts.append(attrs)
+                if tag == "th" and "data-period" in attrs:
+                    self.headers.append(attrs)
+
+        parser = Cells()
+        parser.feed(render_dashboard(projection, ROOT / "template.html", Decimal("5.25")))
+        self.assertEqual([cell["data-period"] for cell in parser.headers], list(expected))
+        self.assertGreater(len(parser.amounts), 12)
+        for index, cell in enumerate(parser.amounts):
+            self.assertEqual(cell["data-period"], expected[index % 12])
+        return parser.amounts
+
+    def test_periods_follow_accounting_coverage_not_cell_provenance(self):
+        raw = legacy_forecast_config()
+        raw = import_actual_month(raw, "2026-01", actual_record(raw, clients=1000, suppliers=-600))
+        raw = replace_input(raw, row_id="clients", month="2026-02", value=0)
+        raw["tax_payments"]["2026-02"] = {"total": 0, "source": "Accountant-confirmed future Taxes"}
+        projection = project(raw, "2025-12")
+        view = report_view(projection, Decimal("5.25"))
+        expected = ("actual",) * 2 + ("forecast",) * 10
+        self.assertEqual(view.month_kinds, expected)
+        amounts = self.assert_snapshot_periods(projection, expected)
+        combinations = {(cell["data-provenance"], cell["data-period"]) for cell in amounts}
+        for pair in (("actual-net-estimate", "actual"), ("allocation-incomplete", "actual"),
+                     ("derived", "actual"), ("override", "forecast"), ("confirmed", "forecast"),
+                     ("derived", "forecast"), ("estimate", "forecast")):
+            self.assertIn(pair, combinations)
+        shifted = report_view(project(raw, "2026-01"), Decimal("2"))
+        self.assertEqual(shifted.month_kinds[:11], view.month_kinds[1:])
+        imported = import_actual_month(raw, "2026-02", actual_record(raw, clients=500))
+        self.assertEqual(report_view(project(imported, "2025-12"), Decimal("5.25")).month_kinds,
+                         ("actual",) * 3 + ("forecast",) * 9)
+
+    def test_all_actual_and_all_forecast_views_including_legacy_source_report(self):
+        for projection, expected in (
+            (project(base_config()), ("forecast",) * 12),
+            (project(legacy_forecast_config(), "2025-01"), ("actual",) * 12),
+            (load_actuals(ROOT / "accounting/actuals-2025.yaml"), ("actual",) * 12),
+        ):
+            with self.subTest(report=type(projection).__name__, expected=expected[0]):
+                self.assertEqual(report_view(projection, Decimal("5.25")).month_kinds, expected)
+                self.assert_snapshot_periods(projection, expected)
 
 
 class MigrationAndReportTests(unittest.TestCase):
@@ -450,7 +505,7 @@ class MigrationAndReportTests(unittest.TestCase):
         self.assertEqual(next(r.activity for r in projection.rows if r.id == "fixed-assets"), "investing")
 
     def test_every_reported_cash_value_and_balance_matches_reference(self):
-        c = load_config(ROOT / "cashflow.yaml")
+        c = validate_config(legacy_forecast_config())
         reference = load_actuals(ROOT / "accounting/actuals-2025.yaml")
         for index in range(12):
             actual = c.actuals[reference.start_month + index]
@@ -463,7 +518,7 @@ class MigrationAndReportTests(unittest.TestCase):
         self.assertEqual(calculate_projection(c).months[0].opening_balance, reference.cashflow.closing_balance.total)
 
     def test_historical_cells_show_estimated_net_and_preserve_discrepancy_notes(self):
-        c = load_config(ROOT / "cashflow.yaml")
+        c = validate_config(legacy_forecast_config())
         p = calculate_projection(c, "2025-01")
         self.assertEqual(cells(p, "clients")[0].value, Decimal("105649.58"))
         self.assertEqual(c.actuals[c.settings.history_start].values["clients"], 125723)

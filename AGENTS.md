@@ -27,7 +27,7 @@ Keez source interpretation and migration evidence.
 - Store human changes in `rows[].overrides[YYYY-MM]`. Remove a key to restore
   estimation; missing and zero are different states.
 - `carry` overrides establish a new run rate; `zero` overrides apply only to
-  their month. Never persist generated estimates as actuals or overrides.
+  their month. Never persist engine-generated estimates as actuals or overrides.
 - VAT, Taxes, dividend cash, subtotals, and rolled-forward balances are derived
   for forecast months and are not browser-editable inputs.
 - Forecast eligibility follows accounting coverage, not the current date.
@@ -38,6 +38,30 @@ Keez source interpretation and migration evidence.
 - `settings.initial_balance` applies at `settings.history_start`. Reported
   actual balances take precedence with engine-produced reconciliation notes.
 - `settings.ron_per_eur` is the positive fixed display conversion; EUR is read-only.
+
+## Assistant-Prepared Clients Estimates
+
+- This is a file/chat input-preparation rule, not an application feature. The user
+  explicitly requested online research and stored monthly values; do not add a
+  contract model, calendar logic, dependencies, or frontend explanations.
+- Approved assumptions from 2026-09 cash onward: one ongoing contract, EUR 45/hour
+  excluding VAT, 8 billable hours per Romanian working day, with collection in
+  the following month. Use the approved fixed 5.25 RON/EUR assumption until changed.
+- Query current published Romanian working-day counts for each required work
+  month and cross-check at least two sources. Exclude weekends and public holidays;
+  do not silently deduct personal leave or government bridge days. Resolve source
+  disagreements before publishing values. Record links and lookup date internally
+  in `DECISIONS.md`, rather than table tooltips.
+- As an explicit input-preparation exception, compute each monthly net RON
+  assumption as verified working days × 8 × 45 × 5.25, using decimal arithmetic
+  and cent rounding. Store only the resulting dated amounts in Clients
+  `overrides`; the user accepted override provenance for these scenario estimates.
+  Do not write them to actuals or persist the engine's calculated outputs.
+- Populate each requested forecast cash month separately. Preserve explicit user
+  adjustments and closed actuals. Extending the forecast requires another online
+  lookup; the engine's carry beyond the last supplied value is not a workday estimate.
+  Existing override/clear semantics still apply. Run the engine after saving and
+  quote balances only from its output.
 
 ## Accounting Updates and Reference Sources
 
@@ -112,7 +136,8 @@ Keez source interpretation and migration evidence.
   remaining losses or liabilities. Losses carry across years until absorbed or
   replaced by a checkpoint.
 - Engine calculations round monetary outputs to cents with ROUND_HALF_UP.
-  Keep all financial arithmetic in `engine.py`.
+  Keep financial model arithmetic in `engine.py`; the assistant-prepared Clients
+  inputs above are the explicit user-approved preparation exception.
 
 ## Browser Persistence
 

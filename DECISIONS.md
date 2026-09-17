@@ -110,6 +110,126 @@ a newer actual or override supersedes it.
 A recurring row without any usable history requires an explicit sourced net
 starting assumption; a missing actual must not silently become zero.
 
+### Assistant-prepared contract estimates (2026-09-17)
+
+The user requested an internal assistant workflow: look up monthly Romanian
+working days online, calculate the net cash assumption, and store the resulting
+number. They explicitly rejected adding a contract/calendar feature to the app.
+The active schema remains version 3. These user-approved scenario inputs use
+Clients `overrides`; the user accepted that technical provenance even though
+the amounts are estimates, not confirmed receipts.
+
+Assumptions: one ongoing contract without a planned end date, EUR 45/hour net
+of VAT, 8 billable hours on every Monday–Friday except Romanian public holidays,
+fixed 5.25 RON/EUR, and collection in the following month. The cash estimates
+start in September 2026, which therefore uses August's working-day count.
+
+Published counts were checked online on 2026-09-17 against
+[Edenred](https://www.edenred.ro/ro/calendarul-zilelor-lucratoare),
+[ZileLibere.eu](https://zilelibere.eu/ro/zile-lucratoare/2026), and
+[BAPP](https://bapp.ro/portal/zile-lucratoare/?an=2026). All three agree on the
+months below. August 15 falls on Saturday; November 30 is a weekday holiday.
+No additional personal leave or government bridge days are assumed.
+
+Source screening: [CalculatorFiscal](https://calculatorfiscal.ro/zile-lucratoare-2026)
+agrees on August–November but omits January 6 and 7 from its holiday list, explaining
+its conflicting annual total of 252 versus 250. The three cross-check sources above
+include those holidays. Calculator-Salarii's fetched HTML contained unrendered
+placeholder counts, so it was not used as monthly evidence.
+
+| Cash month | Work month | Working days | Clients estimate, net RON |
+| --- | --- | ---: | ---: |
+| 2026-09 | 2026-08 | 21 | 39,690.00 |
+| 2026-10 | 2026-09 | 22 | 41,580.00 |
+| 2026-11 | 2026-10 | 22 | 41,580.00 |
+| 2026-12 | 2026-11 | 20 | 37,800.00 |
+
+Each amount is working days × 8 × 45 × 5.25. The YAML stores only the dated
+amounts; this internal rule is applied again when more months are requested.
+Each populated month has its own value, so editing one does not replace later
+dated entries. Existing `carry` behavior still applies to missing months beyond
+the populated horizon, and clearing a key restores that existing engine behavior.
+Actual accounting supersedes these assumptions in closed months. Working-day
+sources and reasoning stay in files/chat, outside the reader-facing table.
+
+#### 2027 cash extension (lookup 2026-09-17)
+
+At the user's request, apply the same assumptions to every cash month from
+January through December 2027. The one-month collection lag requires working-day
+counts for December 2026 through November 2027.
+
+- December 2026: 21 working days, cross-checked at
+  [ZileLibere.eu](https://zilelibere.eu/ro/zile-lucratoare/decembrie-2026) and
+  [BAPP 2026](https://bapp.ro/portal/zile-lucratoare/?an=2026).
+- January–November 2027: the monthly counts agree at
+  [ZileLibere.eu 2027](https://zilelibere.eu/ro/zile-lucratoare/2027) and
+  [SalariuCalculator.ro 2027](https://salariucalculator.ro/zile-lucratoare/2027).
+- Disagreement resolved: [BAPP 2027](https://bapp.ro/portal/zile-lucratoare/?an=2027)
+  reports January as 20 days rather than 18. Its
+  [holiday list](https://bapp.ro/portal/zile-libere/?an=2027) omits January 6 and 7.
+  Both are weekday national holidays, independently confirmed by
+  [Time and Date](https://www.timeanddate.com/holidays/romania/2027). Use 18 days
+  for January work, collected in February. BAPP agrees on the remaining required
+  2027 work months. No personal leave or government bridge days are deducted.
+
+| Cash month | Work month | Working days | Clients estimate, net RON |
+| --- | --- | ---: | ---: |
+| 2027-01 | 2026-12 | 21 | 39,690.00 |
+| 2027-02 | 2027-01 | 18 | 34,020.00 |
+| 2027-03 | 2027-02 | 20 | 37,800.00 |
+| 2027-04 | 2027-03 | 23 | 43,470.00 |
+| 2027-05 | 2027-04 | 21 | 39,690.00 |
+| 2027-06 | 2027-05 | 20 | 37,800.00 |
+| 2027-07 | 2027-06 | 20 | 37,800.00 |
+| 2027-08 | 2027-07 | 22 | 41,580.00 |
+| 2027-09 | 2027-08 | 22 | 41,580.00 |
+| 2027-10 | 2027-09 | 22 | 41,580.00 |
+| 2027-11 | 2027-10 | 21 | 39,690.00 |
+| 2027-12 | 2027-11 | 21 | 39,690.00 |
+
+All twelve amounts were prepared using Decimal arithmetic with cent rounding
+and stored as separate Clients overrides. The supplied estimate horizon now
+ends at December 2027 cash; subsequent cash months require another online lookup.
+
+### Suppliers scenario override (2026-09-17)
+
+The user replaced the December-2025 carry assumption with the January–August
+2026 YTD average for the remaining 2026 months, and explicit zero for 2027.
+The eight complete company Suppliers net actuals total RON -523,158.16; the
+approved monthly average is RON -65,394.77. Partial September is excluded.
+
+Store `suppliers.overrides[2026-09] = -65394.77` and
+`suppliers.overrides[2027-01] = 0.00`. Existing carry semantics apply the first
+value through December 2026 and the second throughout 2027. These are explicit
+scenario assumptions; later imports do not automatically recompute this average.
+The input uses the complete company net amounts on their recorded accounting
+basis, with no project subtraction. Pending allocation reviews remain pending.
+
+### Payroll scenario override (2026-09-17)
+
+The user confirmed one employee paid at the current legal minimum and approved
+the published full-time, general-sector employer-cost benchmark of RON 4,418
+per month, replacing the December-2025 carry assumption. This is RON 4,325 gross
+salary plus RON 93 employer CAM, using the published whole-RON calculation with
+the eligible RON 200 tax-free amount. Payroll includes salary and associated
+payroll obligations together; those obligations are not added again to Taxes.
+
+Sources checked online on 2026-09-17:
+- [HG 146/2026](https://legislatie.just.ro/Public/DetaliiDocument/308231) sets the
+  general minimum gross salary at RON 4,325 from 1 July 2026.
+- [Ministry of Labour announcement](https://mmuncii.gov.ro/salariul-de-baza-minim-brut-pe-tara-garantat-in-plata-se-majoreaza/)
+  confirms the amount and effective date.
+- [SalariuCalculator.ro](https://salariucalculator.ro/salariu-minim) and
+  [Calculator-Salariu.net](https://calculator-salariu.net/salariu-minim.html)
+  both publish RON 4,418 as the total monthly employer cost.
+
+Store `net-salaries-and-taxes.overrides[2026-09] = -4418.00`. Existing carry
+semantics apply this budget through December 2026 and all of 2027. The unchanged
+2027 amount is an explicit scenario assumption using the current cost, to be
+revisited for legally established wage or payroll-tax changes. It is not a
+separately verified 2027 statutory cost. Historical cash actuals retain their
+reported payment timing, and pending allocation reviews remain pending.
+
 ## 5. VAT
 
 ### Basis and rate schedule
@@ -307,8 +427,10 @@ The following choices resolve the previously open details:
    not establish those carry balances.
 2. **Incomplete coverage:** the user chose complete months only. Actual records
    are contiguous from the dated history start, require every row and a reported
-   closing balance, and are published only when complete. No 2026 actuals have
-   been provisioned. Recurring rows without history require an explicit seed.
+   closing balance, and are published only when complete. At the initial release,
+   no 2026 actuals had been provisioned. January–August 2026 was subsequently
+   imported on 2026-09-16; see `ACCOUNTING_NOTES.md` for reconciliation and the
+   pending Regio review. Recurring rows without history require an explicit seed.
 3. **Year-end losses:** the user chose carry-forward across years until absorbed
    or replaced by explicit state. Neither January nor changing the view resets
    losses automatically.
@@ -335,8 +457,8 @@ Implementation details consistent with those choices:
   compact month-window control. Navigation is retained in the URL; supported
   windows fit within 100 years from history start and end by 9999-12.
 - Clearing the input and saving sends JSON null to remove an override.
-- Historical source balances take precedence, with visible-on-hover
-  reconciliation explanations; forecast balances roll forward from them.
+- Historical source balances take precedence, with reconciliation explanations
+  retained in engine notes; forecast balances roll forward from them.
 - An actual dividend payout needs a matching gross event or explicit next-month
   tax information. Actual zero payouts deactivate earlier planned payouts and
   their derived withholding rather than leaving a duplicate future tax.
@@ -387,10 +509,10 @@ including the historical 2025 months.
   VAT cash row. This preserves source cash totals exactly, including refunds and
   cent-rounding edge cases.
 - Original actual amounts remain sourced records. The three converted display
-  cells are locked, marked `actual-net-estimate`, and explain their original
-  cash amounts, rate, and assumed VAT split. This presentation does not establish
-  historical tax carry state; reported balances and reconciliation notes anchor
-  the timeline.
+  cells are locked, marked `actual-net-estimate`, and retain engine notes describing
+  their original cash amounts, rate, and assumed VAT split. This presentation does
+  not establish historical tax carry state; reported balances and reconciliation
+  notes anchor the timeline.
 - Net actuals, net forecast inputs, and reported amounts explicitly assumed net
   display directly. New accounting information supersedes the estimated split
   and establishes the next forecast run rate.
@@ -449,6 +571,23 @@ Source values, YAML, calculations, CLI output, and provenance notes remain signe
 Closing Balance retains its larger 16 px text and red negative values. Wider
 month columns accommodate the amounts, with horizontal scrolling on smaller
 screens and compact padding for landscape printing.
+
+Actual and forecast periods are distinguished by a subtle translucent lavender
+fill on forecast amount cells and their month headers, in the live table and
+snapshot, including print. It layers over the section/alternating-row backgrounds
+and preserves amount colors, including red negative closing balances. Header
+tooltips identify Actual or Forecast. The engine supplies `ReportView.month_kinds`
+from accounting coverage, independently of cell provenance: totals, overrides,
+and confirmed future payments remain in forecast periods, while historical
+`actual-net-estimate` cells and pending project allocations belong to actual
+periods. Navigation and incoming accounting updates refresh that classification.
+
+Amount-cell tooltips in the live table and snapshot do not display internal
+provenance, source, calculation, or reconciliation notes. Those details remain
+in the engine/accounting records for the file/chat audit workflow. Tooltips are
+limited to concise interface guidance: Actual/Forecast month headers, the selected
+window, and signed-RON editing/clearing instructions or a current save error.
+Movement-detail popovers are deferred at the user's request.
 
 ## 16. Regio expense forecasts and actual ownership
 

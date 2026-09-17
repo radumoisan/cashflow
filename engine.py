@@ -369,6 +369,7 @@ class ReportView:
     currency: str
     months: tuple[str, ...]
     month_labels: tuple[str, ...]
+    month_kinds: tuple[str, ...]
     opening_balance: ReportRow
     activity_groups: tuple[ReportGroup, ...]
     closing_balance: ReportRow
@@ -2048,6 +2049,7 @@ def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> Rep
             source_currency,
             months,
             tuple(format_month_label(month.month) for month in report.months),
+            tuple("actual" if month.month <= report.actual_through else "forecast" for month in report.months),
             balance_row("opening-balance", "Opening Balance", "opening_balance", "opening_note"),
             tuple(groups),
             balance_row("closing-balance", "Closing Balance", "closing_balance", "closing_note"),
@@ -2098,6 +2100,7 @@ def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> Rep
         source_currency,
         tuple(format_month(report.start_month + index) for index in range(12)),
         tuple(format_month_label(report.start_month + index) for index in range(12)),
+        ("actual",) * 12,
         _report_row(
             "opening-balance",
             "Opening Balance",
@@ -2128,7 +2131,7 @@ def report_view(report: Projection | ActualsReport, ron_per_eur: Decimal) -> Rep
 
 
 def _render_amount_cell(
-    cell: MoneyCell, source_currency: str
+    cell: MoneyCell, source_currency: str, month_kind: str
 ) -> str:
     value_class = " negative" if cell.source.startswith("-") else ""
     ron_text = html.escape(cell.ron, quote=True)
@@ -2139,26 +2142,26 @@ def _render_amount_cell(
     return (
         f'<td class="amount{value_class}" data-ron="{ron_text}" '
         f'data-eur="{eur_text}" data-provenance="{html.escape(cell.provenance, quote=True)}" '
-        f'title="{html.escape(cell.note, quote=True)}">{visible_text}</td>'
+        f'data-period="{html.escape(month_kind, quote=True)}">{visible_text}</td>'
     )
 
 
 def _render_balance_body(
-    row: ReportRow, source_currency: str
+    row: ReportRow, source_currency: str, month_kinds: tuple[str, ...]
 ) -> str:
     row_class = "opening-row" if row.id == "opening-balance" else "closing-row"
     return (
         '<tbody class="balance-section">'
         f'<tr class="balance-row {row_class}"><th scope="row">{html.escape(row.name)}</th>'
         + "".join(
-            _render_amount_cell(cell, source_currency) for cell in row.cells
+            _render_amount_cell(cell, source_currency, kind) for cell, kind in zip(row.cells, month_kinds)
         )
         + "</tr></tbody>"
     )
 
 
 def _render_activity_group(
-    group: ReportGroup, source_currency: str, ancestors: tuple[str, ...] = ()
+    group: ReportGroup, source_currency: str, month_kinds: tuple[str, ...], ancestors: tuple[str, ...] = ()
 ) -> str:
     escaped_id = html.escape(group.id, quote=True)
     escaped_name = html.escape(group.name)
@@ -2171,7 +2174,7 @@ def _render_activity_group(
             + "".join(
                 f'<tr class="standalone-row {escaped_id}-row">'
                 f'<th scope="row">{html.escape(row.name)}</th>'
-                + "".join(_render_amount_cell(cell, source_currency) for cell in row.cells)
+                + "".join(_render_amount_cell(cell, source_currency, kind) for cell, kind in zip(row.cells, month_kinds))
                 + "</tr>"
                 for row in group.rows
             )
@@ -2194,7 +2197,7 @@ def _render_activity_group(
             f'<tr class="subcategory-row {escaped_id}-row">'
             f'<th scope="row">{html.escape(row.name)}</th>'
             + "".join(
-                _render_amount_cell(cell, source_currency) for cell in row.cells
+                _render_amount_cell(cell, source_currency, kind) for cell, kind in zip(row.cells, month_kinds)
             )
             + "</tr>"
             for row in group.rows
@@ -2206,23 +2209,23 @@ def _render_activity_group(
         f'<tr class="subtotal-row {escaped_id}-subtotal">'
         f'<th scope="row">{html.escape(group.subtotal.name)}</th>'
         + "".join(
-            _render_amount_cell(cell, source_currency) for cell in group.subtotal.cells
+            _render_amount_cell(cell, source_currency, kind) for cell, kind in zip(group.subtotal.cells, month_kinds)
         )
         + "</tr></tbody>"
     )
-    return heading + children + "".join(_render_activity_group(child, source_currency, (*ancestors, group.id)) for child in group.children) + subtotal
+    return heading + children + "".join(_render_activity_group(child, source_currency, month_kinds, (*ancestors, group.id)) for child in group.children) + subtotal
 
 
 def _render_report_rows(view: ReportView) -> str:
     gap = '<tbody class="section-gap" aria-hidden="true"><tr><td colspan="13"></td></tr></tbody>'
     return gap.join(
         [
-            _render_balance_body(view.opening_balance, view.currency),
+            _render_balance_body(view.opening_balance, view.currency, view.month_kinds),
             *[
-                _render_activity_group(group, view.currency)
+                _render_activity_group(group, view.currency, view.month_kinds)
                 for group in view.activity_groups
             ],
-            _render_balance_body(view.closing_balance, view.currency),
+            _render_balance_body(view.closing_balance, view.currency, view.month_kinds),
         ]
     )
 
@@ -2253,7 +2256,10 @@ def render_dashboard(
         "ron_pressed": str(source_currency == "RON").lower(),
         "eur_pressed": str(source_currency == "EUR").lower(),
         "table_rows": table_rows,
-        "month_headers": "".join(f'<th scope="col">{label}</th>' for label in view.month_labels),
+        "month_headers": "".join(
+            f'<th data-period="{kind}" title="{label}: {kind.title()}" scope="col">{label}</th>'
+            for label, kind in zip(view.month_labels, view.month_kinds)
+        ),
     }
     return template.substitute(values)
 

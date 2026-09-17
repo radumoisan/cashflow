@@ -49,7 +49,7 @@
   const collapsedGroups = () => new Set([...document.querySelectorAll('.group-toggle[aria-expanded="false"]')].map((button) => button.getAttribute("aria-controls")));
   const groupSignature = (group) => [group.id, group.name, Boolean(group.subtotal), (group.children || []).map(groupSignature)];
   const signature = (view) => JSON.stringify({
-    months: view.months, monthLabels: view.month_labels, currency: view.currency,
+    months: view.months, monthLabels: view.month_labels, monthKinds: view.month_kinds, currency: view.currency,
     rows: rows(view).map((row) => [row.id, row.name]),
     groups: view.activity_groups.map(groupSignature),
   });
@@ -80,8 +80,6 @@
     cell.classList.toggle("negative", value.source.startsWith("-"));
     cell.classList.toggle("invalid", Boolean(draft?.error));
     cell.classList.toggle("pending", Boolean(draft?.pending));
-    const description = `${value.provenance}: ${value.note}`;
-    cell.title = description;
     if (state.currency !== "RON" || !value.editable) {
       cell.textContent = state.currency === "EUR" ? value.eur : value.ron;
       cell.classList.toggle("accounting-negative", cell.textContent.startsWith("("));
@@ -124,7 +122,7 @@
       cell.replaceChildren(input);
     }
     input.setAttribute("aria-label", `${rowName}, ${cell.dataset.month} cash flow amount, ${value.provenance}`);
-    input.title = draft?.error || `${description}. Signed RON assumption. Clear to restore automatic estimation.`;
+    input.title = draft?.error || "Enter a signed RON amount. Clear to use the automatic forecast.";
     input.disabled = state.loading;
     if (draft?.error) input.setAttribute("aria-invalid", "true");
     else input.removeAttribute("aria-invalid");
@@ -135,7 +133,7 @@
 
   function tableRow(data, view, className) {
     const cells = data.cells.map((value, index) => {
-      const cell = element("td", { className: "amount", "data-row-id": data.id, "data-month": view.months[index] });
+      const cell = element("td", { className: "amount", "data-row-id": data.id, "data-month": view.months[index], "data-period": view.month_kinds[index] });
       paintCell(cell, value, data.name);
       return cell;
     });
@@ -218,7 +216,10 @@
     const scroll = { left: previousScroll?.scrollLeft || 0, top: previousScroll?.scrollTop || 0 };
     const table = element("table", { "aria-label": "Twelve-month cash flow" }, [
       element("colgroup", {}, [element("col", { className: "category-column" }), element("col", { span: "12" })]),
-      element("thead", {}, [element("tr", {}, [element("th", { scope: "col", text: "Category" }), ...view.month_labels.map((label) => element("th", { scope: "col", text: label }))])]),
+      element("thead", {}, [element("tr", {}, [element("th", { scope: "col", text: "Category" }), ...view.month_labels.map((label, index) => element("th", {
+        scope: "col", text: label, "data-period": view.month_kinds[index],
+        title: `${label}: ${view.month_kinds[index] === "actual" ? "Actual" : "Forecast"}`,
+      }))])]),
       element("tbody", { className: "balance-section" }, [tableRow(view.opening_balance, view, "balance-row opening-row")]),
       ...view.activity_groups.flatMap((group) => [sectionGap(view), ...groupBodies(group, view, collapsed)]),
       sectionGap(view),

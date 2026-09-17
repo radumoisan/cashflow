@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -11,9 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from decimal import Decimal
-from engine import evaluate_config, load_config, parse_month, report_view
+from engine import evaluate_config, import_actual_month, load_config, parse_month, report_view
 import server
 from server import API_VERSION, MAX_REQUEST_BYTES, create_app
+from tests.fixtures import actual_record, legacy_forecast_bytes, legacy_forecast_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +28,7 @@ class ServerTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         self.config_path = self.root / "cashflow.yaml"
-        shutil.copy2(PROJECT_ROOT / "cashflow.yaml", self.config_path)
+        self.config_path.write_bytes(legacy_forecast_bytes())
         self.static_path = self.root / "frontend"
         (self.static_path / "assets").mkdir(parents=True)
         (self.static_path / "index.html").write_text("frontend", encoding="utf-8")
@@ -90,6 +90,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(invalid.get_json()["error"]["code"], "config_validation")
         self.assertNotEqual(state["revision"], hashlib.sha256(self.config_path.read_bytes()).hexdigest())
+
+    def test_month_classification_updates_with_imports_and_selected_window(self):
+        from tests.test_regio_api import scenario_bytes
+        raw = legacy_forecast_config()
+        before, etag = self.state()
+        self.assertEqual(before["report"]["month_kinds"], ["forecast"] * 12)
+        updated = import_actual_month(raw, "2026-01", actual_record(raw, clients=500))
+        self.config_path.write_bytes(scenario_bytes(updated))
+        response = self.client.get("/api/state", headers={"If-None-Match": etag})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["report"]["month_kinds"], ["actual"] + ["forecast"] * 11)
+        shifted = self.client.get("/api/state?start=2025-12").get_json()
+        self.assertEqual(shifted["report"]["month_kinds"], ["actual"] * 2 + ["forecast"] * 10)
+        self.assertEqual(shifted["revision"], response.json["revision"])
 
     def test_row_update_recalculates_exactly_as_engine(self) -> None:
         before, etag = self.state()

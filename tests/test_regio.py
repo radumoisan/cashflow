@@ -8,7 +8,7 @@ from engine import (ConfigError, allocation_status, calculate_projection, expens
                     initialize_expense_project, load_config, parse_month, replace_input,
                     report_view, render_dashboard, validate_config)
 from keez import parse_movements_pdf
-from tests.fixtures import actual_record, base_config, zero_config
+from tests.fixtures import actual_record, base_config, legacy_forecast_config, zero_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -260,8 +260,7 @@ class RegioEngineTests(unittest.TestCase):
         self.assertEqual(records, parse_movements_pdf(data, "Keez source", {r.id for r in config.rows}, config.settings.registration_number))
         with self.assertRaisesRegex(ConfigError, "registration"):
             parse_movements_pdf(data, "Keez source", {r.id for r in config.rows}, "wrong")
-        from server import _round_trip_yaml
-        _, raw = _round_trip_yaml((ROOT / "cashflow.yaml").read_bytes(), ROOT / "cashflow.yaml")
+        raw = legacy_forecast_config()
         before = project(raw)
         imported = import_expense_movements(raw, records)
         key = next(key for key, m in records.items() if m["row_id"] == "fixed-assets")

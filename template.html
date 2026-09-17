@@ -11,6 +11,7 @@
       --stripe: #f5f3fa;
       --accent: #27206f;
       --header: #f7f7f8;
+      --forecast-tint: rgba(116, 92, 186, 0.10);
     }
 
     * { box-sizing: border-box; }
@@ -138,6 +139,12 @@
     }
 
     td.amount.accounting-negative { padding-right: var(--amount-inset); }
+
+    /* Layer forecast shading over the existing section and alternating row fills. */
+    td.amount[data-period="forecast"], thead th[data-period="forecast"] {
+      background-image: linear-gradient(var(--forecast-tint), var(--forecast-tint));
+      print-color-adjust: exact;
+    }
 
     .section-gap td {
       height: 6px;

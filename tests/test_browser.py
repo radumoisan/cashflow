@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 import threading
 import time
@@ -13,10 +12,11 @@ from pathlib import Path
 from flask import request
 from werkzeug.serving import make_server
 
-from engine import load_config, replace_input
+from engine import import_actual_month, load_config, replace_input
 from server import _round_trip_yaml, create_app
 from tests.test_regio import closed_scenario, review, tag
 from tests.test_regio_api import scenario_bytes
+from tests.fixtures import actual_record, legacy_forecast_bytes, legacy_forecast_config
 
 ENABLED = os.environ.get("CASHFLOW_BROWSER_TESTS") == "1"
 if ENABLED:
@@ -47,7 +47,7 @@ class BrowserTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "cashflow.yaml"
-        shutil.copy2(ROOT / "cashflow.yaml", self.path)
+        self.path.write_bytes(legacy_forecast_bytes())
         self.control = {"before_patch": None, "delay": 0, "patches": 0, "fail": False}
         app = create_app(self.path, ROOT / "frontend")
 
@@ -140,15 +140,15 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.driver.find_elements(By.CSS_SELECTOR, 'input[type="file"], dialog'), [])
         for id in ("vat", "taxes", "dividends-paid", "opening-balance", "closing-balance"):
             self.assertEqual(self.cell(id).find_elements(By.TAG_NAME, "input"), [])
-        self.assertIn("estimated net conversion", self.input().get_attribute("title"))
+        self.assertEqual(self.input().get_attribute("title"), "Enter a signed RON amount. Clear to use the automatic forecast.")
+        self.assertEqual(self.driver.find_elements(By.CSS_SELECTOR, "td.amount[title]"), [])
         self.assertIn("clients", self.input().get_attribute("aria-label").lower())
         before = self.path.read_bytes()
         self.set_period("2025-01")
         self.assertEqual(self.driver.find_element(By.CSS_SELECTOR, "thead th:nth-child(2)").text, "Jan 25")
         self.assertEqual(len(self.driver.find_elements(By.CSS_SELECTOR, "td.amount input")), 0)
         self.assertEqual(self.source("clients", "2025-01"), "105649.58")
-        self.assertIn("RON 125,723.00", self.cell("clients", "2025-01").get_attribute("title"))
-        self.assertIn("Source reconciliation", self.cell("opening-balance", "2025-04").get_attribute("title"))
+        self.assertEqual(self.driver.find_elements(By.CSS_SELECTOR, "td.amount[title]"), [])
         self.set_period("2026-03")
         self.assertEqual(self.driver.find_element(By.CSS_SELECTOR, "thead th:nth-child(2)").text, "Mar 26")
         self.assertEqual(self.driver.find_element(By.CSS_SELECTOR, "thead th:last-child").text, "Feb 27")
@@ -204,25 +204,24 @@ class BrowserTests(unittest.TestCase):
                 self.assertEqual(historical.find_element(By.XPATH, "../th").text, label)
                 self.assertEqual(historical.find_elements(By.TAG_NAME, "input"), [])
                 self.assertEqual(historical.get_attribute("data-provenance"), "actual-net-estimate")
-                self.assertIn("21%", historical.get_attribute("title"))
+                self.assertIsNone(historical.get_dom_attribute("title"))
                 self.assertEqual(historical.text, ron)
                 self.assertEqual(self.source(id, "2025-12"), source)
                 self.assertEqual(self.source(id, "2026-01"), source)
                 self.assertEqual(self.input(id).get_attribute("value"), ron)
-        self.assertIn("fully deductible", self.cell("suppliers", "2025-12").get_attribute("title"))
         self.assertEqual(self.source("vat", "2025-12"), "-7613.98")
-        self.assertIn("original reported VAT cash RON 0.00", self.cell("vat", "2025-12").get_attribute("title"))
+        self.assertIsNone(self.cell("vat", "2025-12").get_dom_attribute("title"))
         self.assertEqual(self.source("closing-balance", "2025-12"), "3758.00")
         self.driver.find_element(By.CSS_SELECTOR, '[data-currency="EUR"]').click()
         self.wait.until(lambda d: not d.find_elements(By.CSS_SELECTOR, "td.amount input"))
+        self.assertEqual(self.driver.find_elements(By.CSS_SELECTOR, "td.amount[title]"), [])
         for month in ("2025-12", "2026-01"):
             self.assertEqual(self.cell("clients", month).text, "13,962.85")
             self.assertEqual(self.cell("suppliers", month).text, "(20,868.95)")
         self.driver.find_element(By.CSS_SELECTOR, '[data-currency="RON"]').click()
         self.wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "td.amount input"))
         self.set_period("2025-07")
-        self.assertIn("19%", self.cell("clients", "2025-07").get_attribute("title"))
-        self.assertIn("21%", self.cell("clients", "2025-08").get_attribute("title"))
+        self.assertEqual(self.driver.find_elements(By.CSS_SELECTOR, "td.amount[title]"), [])
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_edit_propagation_enter_clear_and_dependent_cells(self):
@@ -339,6 +338,91 @@ class BrowserTests(unittest.TestCase):
                 finally:
                     self.driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": ""})
 
+    def assert_period_fills(self, expected):
+        failures = self.driver.execute_script("""
+            const expected = arguments[0];
+            const failures = [];
+            function check(cell, index) {
+                const image = getComputedStyle(cell).backgroundImage;
+                const tinted = image.includes('rgba(116, 92, 186, 0.1)');
+                if (cell.dataset.period !== expected[index] || tinted !== (expected[index] === 'forecast')) {
+                    failures.push([cell.dataset.rowId || cell.parentElement.className, index, cell.dataset.period, image]);
+                }
+            }
+            const headers = [...document.querySelectorAll('thead th[data-period]')];
+            if (headers.length !== 12) failures.push(['header count', headers.length]);
+            headers.forEach(check);
+            for (const row of document.querySelectorAll('tbody tr')) {
+                row.querySelectorAll('td.amount').forEach(check);
+            }
+            for (const cell of document.querySelectorAll('.section-gap td, .activity-fill, tbody th')) {
+                if (getComputedStyle(cell).backgroundImage !== 'none') failures.push(['unexpected tint', cell.className]);
+            }
+            return failures;
+        """, expected)
+        self.assertEqual(failures, [])
+
+    def test_forecast_fill_mixed_periods_currencies_navigation_mobile_print_and_snapshot(self):
+        from engine import evaluate_config, render_dashboard
+        raw = legacy_forecast_config()
+        raw["settings"]["start_date"] = "2025-12"
+        raw = import_actual_month(raw, "2026-01", actual_record(raw, clients=1000, suppliers=-600))
+        raw["tax_payments"]["2026-02"] = {"total": 0, "source": "Confirmed future Taxes"}
+        self.path.write_bytes(scenario_bytes(raw))
+        self.driver.get(f"http://127.0.0.1:{self.server.server_port}/?start=2025-12")
+        self.wait.until(lambda d: d.find_element(By.CSS_SELECTOR, 'thead th:nth-child(2)').text == 'Dec 25')
+        expected = ["actual"] * 2 + ["forecast"] * 10
+        self.assert_period_fills(expected)
+        self.assertEqual(self.cell("clients", "2025-12").get_attribute("data-provenance"), "actual-net-estimate")
+        self.assertEqual(self.cell("project-regio-suppliers", "2026-01").get_attribute("data-provenance"), "allocation-incomplete")
+        self.assertEqual(self.cell("subtotal-expenses", "2026-01").get_attribute("data-provenance"), "derived")
+        self.assertEqual(self.cell("taxes", "2026-02").get_attribute("data-provenance"), "confirmed")
+        self.enter("90000", month="2026-02")
+        self.wait.until(lambda d: self.source("clients", "2026-02") == "90000.00")
+        self.assertEqual(self.cell("clients", "2026-02").get_attribute("data-provenance"), "override")
+        self.assertEqual(self.input(month="2026-02").value_of_css_property("color"), "rgba(39, 32, 111, 1)")
+        self.assert_period_fills(expected)
+        before = self.path.read_bytes()
+        for start, kinds in (("2025-01", ["actual"] * 12), ("2026-02", ["forecast"] * 12), ("2025-12", expected)):
+            self.set_period(start)
+            self.assert_period_fills(kinds)
+        config = load_config(self.path)
+        snapshot = self.path.parent / "period-snapshot.html"
+        snapshot.write_text(render_dashboard(evaluate_config(config), ROOT / "template.html", config.settings.ron_per_eur))
+        for view in ("live", "snapshot"):
+            if view == "snapshot":
+                self.driver.get(snapshot.as_uri())
+            for width, media in ((1440, ""), (390, ""), (1047, "print")):
+                self.driver.set_window_size(width, 900)
+                self.driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": media})
+                try:
+                    for currency in ("RON", "EUR"):
+                        with self.subTest(view=view, width=width, media=media, currency=currency):
+                            self.driver.execute_script("document.querySelector(arguments[0]).click()", f'[data-currency="{currency}"]')
+                            self.wait.until(lambda d: d.find_element(By.CSS_SELECTOR, 'main').get_attribute('data-display-currency') == currency)
+                            self.assert_period_fills(expected)
+                            self.assertEqual(self.driver.find_elements(By.CSS_SELECTOR, "td.amount[title]"), [])
+                            self.assertEqual(self.driver.find_element(By.CSS_SELECTOR, 'thead th:nth-child(2)').get_attribute('title'), 'Dec 25: Actual')
+                            self.assertEqual(self.driver.find_element(By.CSS_SELECTOR, 'thead th:nth-child(4)').get_attribute('title'), 'Feb 26: Forecast')
+                            closing = self.driver.find_element(By.CSS_SELECTOR, '.closing-row td[data-period="forecast"]')
+                            self.assertEqual(closing.value_of_css_property("color"), "rgba(180, 35, 24, 1)")
+                            self.assert_section_gaps(height=4 if media else 6)
+                            self.assert_amounts_fit()
+                finally:
+                    self.driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": ""})
+            self.driver.execute_script("document.querySelector('[aria-controls=\"group-expenses-children\"]').click()")
+            self.assert_period_fills(expected)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_forecast_fill_refreshes_when_accounting_coverage_advances(self):
+        self.assert_period_fills(["forecast"] * 12)
+        updated = import_actual_month(legacy_forecast_config(), "2026-01", actual_record(legacy_forecast_config(), clients=500))
+        self.path.write_bytes(scenario_bytes(updated))
+        self.wait.until(lambda d: self.source("clients") == "500.00")
+        self.assert_period_fills(["actual"] + ["forecast"] * 11)
+        self.assertFalse(self.cell("clients").find_elements(By.TAG_NAME, "input"))
+        self.assertEqual(self.driver.find_element(By.CSS_SELECTOR, 'thead th:nth-child(2)').get_attribute('title'), 'Jan 26: Actual')
+
     def test_invalid_edit_blocks_currency_and_period_then_escape_discards(self):
         before = self.path.read_bytes()
         self.enter("invalid", save=False)
@@ -386,6 +470,7 @@ class BrowserTests(unittest.TestCase):
         self.wait.until(lambda d: self.input().get_attribute("aria-invalid") == "true")
         self.assertEqual(load_config(self.path).rows[0].overrides, {})
         self.assertEqual(self.input().get_attribute("value"), "321")
+        self.assertEqual(self.input().get_attribute("title"), "Simulated write failure")
         self.input().send_keys(Keys.ENTER)
         self.wait.until(lambda d: self.source("clients") == "321.00")
 
